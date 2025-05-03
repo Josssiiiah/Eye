@@ -19,6 +19,8 @@ fn greet(name: &str) -> String {
 struct ChatMessage {
     role: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_url: Option<String>,
 }
 
 // Define a struct to deserialize the streaming chunk from Mastra
@@ -92,7 +94,7 @@ async fn chat(prompt: String, messages_history: Vec<ChatMessage>) -> std::result
 
     // Use the full history in the arguments
     let args = ChatArguments::new(
-        "gpt-4o-mini",
+        "gpt-4o",
         history // Pass the combined history
     );
 
@@ -131,15 +133,72 @@ async fn chat_mastra<R: Runtime>(
     let client = reqwest::Client::new();
 
     let mut messages_to_send = messages_history;
-    messages_to_send.push(ChatMessage { role: "user".to_string(), content: prompt });
+    
+    // Check if the prompt contains an image (markdown format: ![alt](data:image/png;base64,...))
+    let mut image_url = None;
+    let prompt_text = if prompt.contains("![Screenshot](data:image/") {
+        // Extract the base64 image data
+        if let Some(start_idx) = prompt.find("data:image/") {
+            if let Some(end_idx) = prompt[start_idx..].find(")") {
+                let full_image_url = &prompt[start_idx..start_idx + end_idx];
+                image_url = Some(full_image_url.to_string());
+                
+                // Remove the image markdown from the prompt
+                prompt.replace(&format!("![Screenshot]({})", full_image_url), "")
+                    .trim()
+                    .to_string()
+            } else {
+                prompt
+            }
+        } else {
+            prompt
+        }
+    } else {
+        prompt
+    };
+    
+    // Add the user message, potentially with an image
+    messages_to_send.push(ChatMessage { 
+        role: "user".to_string(), 
+        content: prompt_text,
+        image_url,
+    });
+
+    // Format messages for Mastra's API format - exactly like the bird-checker example 
+    let formatted_messages = messages_to_send.iter().map(|msg| {
+        let mut content_array = Vec::new();
+        
+        // Add image if present (should come first based on examples)
+        if let Some(img_url) = &msg.image_url {
+            content_array.push(serde_json::json!({
+                "type": "image",
+                "image": img_url,
+                "detail": "low"  // Set to "low" to save tokens and speed up responses
+            }));
+        }
+        
+        // Add text content
+        content_array.push(serde_json::json!({
+            "type": "text",
+            "text": msg.content
+        }));
+        
+        serde_json::json!({
+            "role": msg.role,
+            "content": content_array
+        })
+    }).collect::<Vec<_>>();
 
     // Add "stream": true to the request body
     let request_body = serde_json::json!({
-        "messages": messages_to_send,
+        "messages": formatted_messages,
         "stream": true // Request streaming
     });
 
-    println!("Sending streaming request to Mastra: {:?}", request_body);
+    println!("Sending request to Mastra. Message format:");
+    for (i, msg) in formatted_messages.iter().enumerate() {
+        println!("Message {}: {}", i, serde_json::to_string_pretty(msg).unwrap_or_default());
+    }
 
     // Ensure the popup window exists before proceeding
     let window = app.get_webview_window("popup").ok_or_else(|| "Popup window not found".to_string())?;
@@ -164,37 +223,86 @@ async fn chat_mastra<R: Runtime>(
 
     // Process the stream - use the stream method available in reqwest with tokio_stream
     let mut stream = res.bytes_stream();
+    let mut buffer = String::new();
+    let mut has_emitted = false; // Track if we've emitted any content
 
     while let Some(item) = stream.next().await {
         match item {
             Ok(chunk_bytes) => {
-                // Attempt to parse the chunk as JSON
-                // This assumes Mastra sends JSON objects per chunk, like {"text": "..."}
-                // Adjust parsing based on Mastra's actual streaming format (e.g., SSE parsing if needed)
-                match serde_json::from_slice::<MastraStreamChunk>(&chunk_bytes) {
-                    Ok(parsed_chunk) => {
-                         if let Some(text) = parsed_chunk.text {
-                            // Emit the text chunk to the frontend
-                             println!("Emitting chunk: {}", text); // Debugging
-                            window.emit("chat_chunk", &text).map_err(|e| format!("Failed to emit chat chunk event: {}", e))?;
-                         }
-                         // Check for finish reason if Mastra sends one in the stream
-                         if let Some(reason) = parsed_chunk.finish_reason {
-                            println!("Stream finished with reason: {}", reason); // Debugging
-                            break; // Exit loop if finish reason is received
-                         }
+                // Convert the bytes to a string
+                let chunk_str = String::from_utf8_lossy(&chunk_bytes).to_string();
+                println!("Raw chunk: {}", chunk_str); // Debug logging
+                
+                // Append to our buffer
+                buffer.push_str(&chunk_str);
+                
+                // First, check if the buffer contains a complete JSON object
+                if !has_emitted && buffer.starts_with('{') && buffer.ends_with('}') {
+                    // Try parsing as a complete JSON response
+                    match serde_json::from_str::<serde_json::Value>(&buffer) {
+                        Ok(json_value) => {
+                            if let Some(text) = json_value.get("text").and_then(|t| t.as_str()) {
+                                // Found the text in the top-level object
+                                println!("Emitting complete response: {}", text);
+                                window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                has_emitted = true;
+                            }
+                        },
+                        Err(_) => {
+                            // Not a complete valid JSON, might be streaming - continue to SSE processing
+                        }
                     }
-                    Err(e) => {
-                        // If parsing fails, maybe it's just raw text? Or an error in format.
-                        // Log the error and potentially emit the raw chunk or an error message.
-                        eprintln!("Failed to parse stream chunk as JSON: {}. Raw chunk: {:?}", e, String::from_utf8_lossy(&chunk_bytes));
-                         // Optionally emit the raw text if it looks like text
-                        // let raw_text = String::from_utf8_lossy(&chunk_bytes).to_string();
-                        // window.emit("chat_chunk", &raw_text)?;
-                        // Or emit a specific parsing error
-                        let parse_error_msg = format!("Failed to parse stream chunk: {}", e);
-                         window.emit("chat_stream_error", &parse_error_msg).map_err(|e| format!("Failed to emit parse error event: {}", e))?;
-                         // Decide whether to continue or break on parse error
+                }
+                
+                // Process any complete SSE lines
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].trim().to_string(); // Create an owned String here
+                    buffer = buffer[pos + 1..].to_string();
+                    
+                    // Skip empty lines and comments
+                    if line.is_empty() || line.starts_with(':') {
+                        continue;
+                    }
+                    
+                    // Check for data prefix and process it
+                    if line.starts_with("data: ") {
+                        let data = &line[6..]; // Skip "data: " prefix
+                        
+                        // Check if it's an empty data or [DONE] marker
+                        if data == "[DONE]" {
+                            println!("Stream complete marker received");
+                            continue;
+                        }
+                        
+                        // Try to parse as JSON
+                        match serde_json::from_str::<serde_json::Value>(data) {
+                            Ok(json_value) => {
+                                if let Some(text) = json_value.get("text").and_then(|t| t.as_str()) {
+                                    // Valid text chunk found, emit it
+                                    println!("Emitting chunk: {}", text);
+                                    window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                    has_emitted = true;
+                                } else if let Some(finish_reason) = json_value.get("finishReason") {
+                                    // End of stream with finish reason
+                                    println!("Stream finished with reason: {:?}", finish_reason);
+                                } else {
+                                    // Unknown format but valid JSON
+                                    println!("Unknown JSON format: {}", json_value);
+                                }
+                            },
+                            Err(e) => {
+                                // Sometimes data might come in raw text instead of JSON
+                                if !data.is_empty() && !data.starts_with('{') && !data.starts_with('[') {
+                                    // Assume it's plain text if not starting with JSON markers
+                                    println!("Emitting raw text chunk: {}", data);
+                                    window.emit("chat_chunk", data).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                    has_emitted = true;
+                                } else {
+                                    // It's a parsing error for what should be JSON
+                                    println!("Failed to parse data as JSON: {}. Raw data: {}", e, data);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -205,6 +313,21 @@ async fn chat_mastra<R: Runtime>(
                 window.emit("chat_stream_error", &stream_error_msg).map_err(|e| format!("Failed to emit stream error event: {}", e))?;
                 // Terminate processing on stream error
                 return Err(stream_error_msg);
+            }
+        }
+    }
+
+    // Try one more time with any remaining buffer content
+    if !has_emitted && !buffer.is_empty() {
+        match serde_json::from_str::<serde_json::Value>(&buffer) {
+            Ok(json_value) => {
+                if let Some(text) = json_value.get("text").and_then(|t| t.as_str()) {
+                    println!("Emitting final buffer content: {}", text);
+                    window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                }
+            },
+            Err(e) => {
+                println!("Could not parse remaining buffer as JSON: {}", e);
             }
         }
     }
@@ -239,6 +362,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_screenshots::init())
+        .plugin(tauri_plugin_macos_permissions::init())
+        .plugin(tauri_plugin_fs::init())
         .plugin(
             tauri_plugin_sql::Builder::default()
                 .add_migrations("sqlite:notes.db", migrations)
@@ -253,7 +379,13 @@ pub fn run() {
         ])
         // Add setup to ensure AppHandle is available for chat_mastra
         .setup(|app| {
-            // You can perform initial setup here if needed
+            // Allow access to the screenshots directory
+            #[cfg(target_os = "macos")]
+            {
+                use tauri_plugin_fs::FsExt;
+                let scope = app.fs_scope();
+                scope.allow_directory("/Users/josiah/Library/Application Support/com.zen.app/tauri-plugin-screenshots", true);
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

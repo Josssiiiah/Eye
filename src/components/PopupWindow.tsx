@@ -1,12 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { X } from "lucide-react";
+import { X, Camera } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { useEffect, useCallback, useRef, FormEvent, useState } from "react";
 import { cn } from "../lib/utils";
 import { motion, AnimatePresence } from "framer-motion";
 import { useChat, Message } from "@ai-sdk/react";
+import {
+  getScreenshotableMonitors,
+  getMonitorScreenshot,
+} from "tauri-plugin-screenshots-api";
+import {
+  checkScreenRecordingPermission,
+  requestScreenRecordingPermission,
+} from "tauri-plugin-macos-permissions-api";
+import { readFile, BaseDirectory } from "@tauri-apps/plugin-fs";
 
 export default function PopupWindow() {
   // Initialize useChat - only for state management (messages, input, setInput, setMessages)
@@ -18,6 +27,7 @@ export default function PopupWindow() {
   const promptInputRef = useRef<HTMLInputElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null); // Ref for scrolling
   const [isProcessing, setIsProcessing] = useState(false); // Local loading state
+  const [capturing, setCapturing] = useState(false); // State for screenshot capture
   const [fetchError, setFetchError] = useState<string | null>(null); // Local error state
   const [assistantMessageId, setAssistantMessageId] = useState<string | null>(
     null
@@ -79,6 +89,82 @@ export default function PopupWindow() {
       setAssistantMessageId(null);
     }
     // Note: setIsProcessing(false) will be handled by stream end/error events
+  };
+
+  // Handler for screenshot capture
+  const handleCaptureScreenshot = async () => {
+    try {
+      setCapturing(true);
+      // 1. Permission dance for macOS
+      const hasPerm = await checkScreenRecordingPermission();
+      if (!hasPerm) {
+        const granted = await requestScreenRecordingPermission();
+        if (!granted) {
+          setFetchError("Screen recording permission denied");
+          return;
+        }
+        // User must re-click after granting; exit early
+        setCapturing(false);
+        return;
+      }
+
+      // 2. Choose the primary monitor (index 0)
+      const monitors = await getScreenshotableMonitors();
+      if (monitors.length === 0) {
+        throw new Error("No monitor detected");
+      }
+      const pngPath = await getMonitorScreenshot(monitors[0].id);
+
+      // 3. Read the file as binary using the plugin-fs API
+      const imgBinary = await readFile(pngPath);
+
+      // 4. Create an image element to resize it
+      const resizeImage = (imgBuffer: Uint8Array): Promise<string> => {
+        return new Promise((resolve) => {
+          const blob = new Blob([imgBuffer], { type: "image/png" });
+          const url = URL.createObjectURL(blob);
+          const img = new Image();
+
+          img.onload = () => {
+            // Create canvas for resizing
+            const canvas = document.createElement("canvas");
+            canvas.width = 512;
+            canvas.height = 512;
+
+            // Draw image with proper scaling
+            const ctx = canvas.getContext("2d");
+            ctx!.drawImage(img, 0, 0, 512, 512);
+
+            // Get base64 from canvas
+            const base64 = canvas.toDataURL("image/jpeg", 0.9);
+            URL.revokeObjectURL(url);
+            resolve(base64);
+          };
+
+          img.src = url;
+        });
+      };
+
+      // 5. Resize the image and get base64
+      const base64Image = await resizeImage(imgBinary);
+
+      // 6. Add the base64 image to the input (will be processed when sent)
+      // Note: Now using the resized image with JPEG format
+      setInput((prev) =>
+        prev
+          ? `${prev}\n![Screenshot](${base64Image})`
+          : `![Screenshot](${base64Image})`
+      );
+
+      if (promptInputRef.current) {
+        promptInputRef.current.focus();
+      }
+    } catch (err) {
+      console.error("Screenshot error:", err);
+      setFetchError(String(err));
+    } finally {
+      setCapturing(false);
+    }
   };
 
   // Effect to set up event listeners
@@ -302,6 +388,21 @@ export default function PopupWindow() {
                     "transition-all duration-300"
                   )}
                 />
+                {/* Screenshot Button */}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={capturing || isProcessing}
+                  onClick={handleCaptureScreenshot}
+                  className="h-8 w-8 rounded-full px-0 bg-black/70 hover:bg-primary transition-colors shrink-0 flex items-center justify-center"
+                >
+                  {capturing ? (
+                    <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
+                  ) : (
+                    <Camera className="h-4 w-4" />
+                  )}
+                  <span className="sr-only">Take Screenshot</span>
+                </Button>
                 <Button
                   size="sm"
                   variant="ghost"
