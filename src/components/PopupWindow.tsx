@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { X } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -10,8 +11,7 @@ import { useChat, Message } from "@ai-sdk/react";
 export default function PopupWindow() {
   // Initialize useChat - only for state management (messages, input, setInput, setMessages)
   const { messages, input, setInput, setMessages } = useChat({
-    // Remove api and fetch options
-    // We now manage messages and loading state manually
+    // Keep this minimal as we manage streaming via Tauri events
   });
 
   const [isInputFocused, setIsInputFocused] = useState(false);
@@ -19,63 +19,120 @@ export default function PopupWindow() {
   const scrollAreaRef = useRef<HTMLDivElement>(null); // Ref for scrolling
   const [isProcessing, setIsProcessing] = useState(false); // Local loading state
   const [fetchError, setFetchError] = useState<string | null>(null); // Local error state
+  const [assistantMessageId, setAssistantMessageId] = useState<string | null>(
+    null
+  ); // Track current assistant message ID
 
-  // Custom handler to call Tauri command and update messages via setMessages
+  // Custom handler to initiate streaming via Tauri command
   const handleSendMessage = async () => {
-    if (!input.trim() || isProcessing) return; // Prevent sending while processing
+    if (!input.trim() || isProcessing) return;
 
     const currentInput = input;
     const newUserMessage: Message = {
-      id: crypto.randomUUID(), // Generate an ID for the user message
+      id: crypto.randomUUID(),
       role: "user" as const,
       content: currentInput,
     };
 
-    // Update messages optimistically with user message
-    setMessages([...messages, newUserMessage]);
-    setInput(""); // Clear input field
-    setIsProcessing(true); // Set local loading state
-    setFetchError(null); // Clear previous errors
+    // Add user message and a placeholder for assistant response
+    const placeholderId = crypto.randomUUID();
+    const placeholderAssistantMessage: Message = {
+      id: placeholderId,
+      role: "assistant" as const,
+      content: "", // Start with empty content
+    };
 
-    // Prepare history for the backend call *excluding* the ID
-    // Include the *new* user message in the history sent to backend
+    setMessages([...messages, newUserMessage, placeholderAssistantMessage]);
+    setAssistantMessageId(placeholderId); // Track the ID of the message we'll update
+    setInput("");
+    setIsProcessing(true);
+    setFetchError(null);
+
+    // Prepare history *excluding* the placeholder assistant message
     const historyForBackend = [...messages, newUserMessage].map(
       ({ id, ...rest }) => rest
     );
 
     try {
-      const result = await invoke<string>("chat", {
+      // Invoke the Rust command which will start emitting events
+      // It now returns () on success or throws an error if setup fails
+      await invoke("chat_mastra", {
         prompt: currentInput,
-        messagesHistory: historyForBackend, // Send history including the new user msg
+        messagesHistory: historyForBackend,
       });
-
-      const assistantMessage: Message = {
-        id: crypto.randomUUID(), // Generate an ID for the assistant message
-        role: "assistant" as const,
-        content: result,
-      };
-
-      // Update messages with assistant response
-      setMessages((currentMessages) => [...currentMessages, assistantMessage]);
-
+      // Don't update messages here directly, wait for events
       if (promptInputRef.current) {
         promptInputRef.current.focus();
       }
     } catch (err: any) {
-      console.error("Failed to call chat command:", err);
-      let errorMessage = "An unknown error occurred.";
+      console.error("Failed to initiate chat stream:", err);
+      let errorMessage = "Failed to start chat.";
       if (typeof err === "string") {
         errorMessage = err;
       } else if (err instanceof Error) {
         errorMessage = err.message;
       }
-      setFetchError(errorMessage); // Set local error state
-      // Remove the failed user message for simplicity, or add a system error message
+      setFetchError(errorMessage);
+      // Remove placeholder on initial invoke error
       setMessages((currentMessages) => currentMessages.slice(0, -1));
-    } finally {
-      setIsProcessing(false); // Reset local loading state
+      setIsProcessing(false);
+      setAssistantMessageId(null);
     }
+    // Note: setIsProcessing(false) will be handled by stream end/error events
   };
+
+  // Effect to set up event listeners
+  useEffect(() => {
+    let unlistenChunk: (() => void) | undefined;
+    let unlistenEnd: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+
+    const setupListeners = async () => {
+      unlistenChunk = await listen<string>("chat_chunk", (event) => {
+        console.log("Chunk received:", event.payload);
+        setMessages((currentMessages) =>
+          currentMessages.map((msg) =>
+            msg.id === assistantMessageId
+              ? { ...msg, content: msg.content + event.payload }
+              : msg
+          )
+        );
+      });
+
+      unlistenEnd = await listen<void>("chat_stream_end", () => {
+        console.log("Stream ended");
+        setIsProcessing(false);
+        setAssistantMessageId(null); // Reset tracker
+        if (promptInputRef.current) {
+          promptInputRef.current.focus();
+        }
+      });
+
+      unlistenError = await listen<string>("chat_stream_error", (event) => {
+        console.error("Stream error:", event.payload);
+        setFetchError(event.payload);
+        // Update the placeholder message with the error
+        setMessages((currentMessages) =>
+          currentMessages.map((msg) =>
+            msg.id === assistantMessageId
+              ? { ...msg, content: `Error: ${event.payload}` }
+              : msg
+          )
+        );
+        setIsProcessing(false);
+        setAssistantMessageId(null); // Reset tracker
+      });
+    };
+
+    setupListeners();
+
+    // Cleanup function
+    return () => {
+      unlistenChunk?.();
+      unlistenEnd?.();
+      unlistenError?.();
+    };
+  }, [assistantMessageId]); // Re-run if assistantMessageId changes (though it shouldn't mid-stream)
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (
@@ -173,6 +230,7 @@ export default function PopupWindow() {
               {messages.map((m) => (
                 <motion.div
                   key={m.id}
+                  layout // Add layout animation for smoother updates
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0 }}
@@ -180,23 +238,29 @@ export default function PopupWindow() {
                     "p-4 rounded-xl shadow-md border border-border/30 whitespace-pre-wrap text-sm",
                     m.role === "user"
                       ? "bg-primary/10 text-primary-foreground place-self-end ml-10"
-                      : "bg-background/80 place-self-start mr-10"
+                      : "bg-background/80 place-self-start mr-10",
+                    // Add a style for the potentially empty streaming message
+                    m.role === "assistant" &&
+                      m.content === "" &&
+                      isProcessing &&
+                      "min-h-[20px]" // Give it min height while streaming empty
                   )}
                 >
+                  {/* Render content, or a blinking cursor if streaming and content is empty */}
                   {m.content}
+                  {m.role === "assistant" &&
+                    m.id === assistantMessageId &&
+                    isProcessing &&
+                    m.content === "" && (
+                      <span className="animate-pulse">▋</span>
+                    )}
                 </motion.div>
               ))}
 
-              {/* Use local isProcessing state for the loading indicator */}
-              {isProcessing && (
-                <div className="flex justify-start items-center py-2 pl-4">
-                  <div className="relative h-5 w-5">
-                    <div className="absolute inset-0 rounded-full border-t-2 border-l-2 border-accent animate-spin"></div>
-                  </div>
-                </div>
-              )}
+              {/* Loading indicator is now implicitly handled by the streaming message appearance */}
+              {/* You could add a spinner *next* to the input if desired while isProcessing */}
 
-              {/* Use local fetchError state for displaying errors */}
+              {/* Error display */}
               <AnimatePresence>
                 {fetchError && (
                   <motion.div
@@ -205,6 +269,7 @@ export default function PopupWindow() {
                     exit={{ opacity: 0 }}
                     className="text-sm text-red-400 font-medium rounded-md bg-red-500/10 border border-red-500/20 px-4 py-3 mt-4"
                   >
+                    {/* Display general fetch error if not handled by stream error */}
                     Error: {fetchError}
                   </motion.div>
                 )}

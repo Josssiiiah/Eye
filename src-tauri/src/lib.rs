@@ -1,8 +1,10 @@
-use tauri::{AppHandle, Manager, Result, Runtime, WebviewUrl};
+use tauri::{AppHandle, Manager, Result, Runtime, WebviewUrl, Window};
 use tauri_plugin_sql::{Migration, MigrationKind};
 use std::env;
 // Removed unused vibrancy imports as they're commented out in the code
 use serde::{Deserialize, Serialize};
+use reqwest;
+use futures_util::StreamExt;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -15,6 +17,16 @@ fn greet(name: &str) -> String {
 struct ChatMessage {
     role: String,
     content: String,
+}
+
+// Define a struct to deserialize the streaming chunk from Mastra
+// Assuming it sends JSON objects with a 'text' field per chunk
+#[derive(Deserialize, Debug)]
+struct MastraStreamChunk {
+    text: Option<String>,
+    // Add other fields if Mastra sends more, like 'finishReason'
+    #[serde(rename = "finishReason")]
+    finish_reason: Option<String>,
 }
 
 #[tauri::command]
@@ -106,6 +118,102 @@ async fn chat(prompt: String, messages_history: Vec<ChatMessage>) -> std::result
     }
 }
 
+// --- MODIFIED COMMAND ---
+#[tauri::command]
+async fn chat_mastra<R: Runtime>(
+    prompt: String,
+    messages_history: Vec<ChatMessage>,
+    app: AppHandle<R>,
+) -> std::result::Result<(), String> {
+    let mastra_endpoint = "http://localhost:4111/api/agents/weatherAgent/generate";
+    let client = reqwest::Client::new();
+
+    let mut messages_to_send = messages_history;
+    messages_to_send.push(ChatMessage { role: "user".to_string(), content: prompt });
+
+    // Add "stream": true to the request body
+    let request_body = serde_json::json!({
+        "messages": messages_to_send,
+        "stream": true // Request streaming
+    });
+
+    println!("Sending streaming request to Mastra: {:?}", request_body);
+
+    // Ensure the popup window exists before proceeding
+    let window = app.get_webview_window("popup").ok_or_else(|| "Popup window not found".to_string())?;
+
+    // Execute the request and process the stream
+    let res = client.post(mastra_endpoint)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request to Mastra server: {}", e))?;
+
+    let status = res.status();
+    println!("Received response from Mastra. Status: {}", status);
+
+    if !status.is_success() {
+        let error_text = res.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
+        let error_msg = format!("Mastra server returned error ({}): {}", status, error_text);
+         // Emit error event before returning Err
+        window.emit("chat_stream_error", &error_msg).map_err(|e| format!("Failed to emit error event: {}", e))?;
+        return Err(error_msg);
+    }
+
+    // Process the stream
+    let mut stream = res.bytes_stream();
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(chunk_bytes) => {
+                // Attempt to parse the chunk as JSON
+                // This assumes Mastra sends JSON objects per chunk, like {"text": "..."}
+                // Adjust parsing based on Mastra's actual streaming format (e.g., SSE parsing if needed)
+                match serde_json::from_slice::<MastraStreamChunk>(&chunk_bytes) {
+                    Ok(parsed_chunk) => {
+                         if let Some(text) = parsed_chunk.text {
+                            // Emit the text chunk to the frontend
+                             println!("Emitting chunk: {}", text); // Debugging
+                            window.emit("chat_chunk", &text).map_err(|e| format!("Failed to emit chat chunk event: {}", e))?;
+                         }
+                         // Check for finish reason if Mastra sends one in the stream
+                         if let Some(reason) = parsed_chunk.finish_reason {
+                            println!("Stream finished with reason: {}", reason); // Debugging
+                            break; // Exit loop if finish reason is received
+                         }
+                    }
+                    Err(e) => {
+                        // If parsing fails, maybe it's just raw text? Or an error in format.
+                        // Log the error and potentially emit the raw chunk or an error message.
+                        eprintln!("Failed to parse stream chunk as JSON: {}. Raw chunk: {:?}", e, String::from_utf8_lossy(&chunk_bytes));
+                         // Optionally emit the raw text if it looks like text
+                        // let raw_text = String::from_utf8_lossy(&chunk_bytes).to_string();
+                        // window.emit("chat_chunk", &raw_text)?;
+                        // Or emit a specific parsing error
+                        let parse_error_msg = format!("Failed to parse stream chunk: {}", e);
+                         window.emit("chat_stream_error", &parse_error_msg).map_err(|e| format!("Failed to emit parse error event: {}", e))?;
+                         // Decide whether to continue or break on parse error
+                    }
+                }
+            }
+            Err(e) => {
+                // Error reading from the stream
+                let stream_error_msg = format!("Error reading stream from Mastra: {}", e);
+                eprintln!("{}", stream_error_msg);
+                window.emit("chat_stream_error", &stream_error_msg).map_err(|e| format!("Failed to emit stream error event: {}", e))?;
+                // Terminate processing on stream error
+                return Err(stream_error_msg);
+            }
+        }
+    }
+
+    // Signal the end of the stream
+    println!("Emitting stream end"); // Debugging
+    window.emit("chat_stream_end", ()).map_err(|e| format!("Failed to emit stream end event: {}", e))?;
+    Ok(()) // Return Ok(()) as the stream finished successfully
+}
+// --- /MODIFIED COMMAND ---
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Load .env file variables into environment
@@ -138,8 +246,14 @@ pub fn run() {
             greet,
             open_popup_window,
             close_popup_window,
-            chat
+            chat,
+            chat_mastra
         ])
+        // Add setup to ensure AppHandle is available for chat_mastra
+        .setup(|app| {
+            // You can perform initial setup here if needed
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
