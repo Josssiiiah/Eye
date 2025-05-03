@@ -1,10 +1,12 @@
-use tauri::{AppHandle, Manager, Result, Runtime, WebviewUrl, Window};
+use tauri::{AppHandle, Manager, Result, Runtime, WebviewUrl, Window, Emitter};
 use tauri_plugin_sql::{Migration, MigrationKind};
 use std::env;
 // Removed unused vibrancy imports as they're commented out in the code
 use serde::{Deserialize, Serialize};
 use reqwest;
-use futures_util::StreamExt;
+use tokio_stream::StreamExt;
+use reqwest::Response;
+use bytes::Bytes;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -160,7 +162,7 @@ async fn chat_mastra<R: Runtime>(
         return Err(error_msg);
     }
 
-    // Process the stream
+    // Process the stream - use the stream method available in reqwest with tokio_stream
     let mut stream = res.bytes_stream();
 
     while let Some(item) = stream.next().await {
