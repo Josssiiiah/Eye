@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { X, Camera, Download, Check } from "lucide-react";
+import { X, Camera, Download, Check, Trash } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { useEffect, useCallback, useRef, FormEvent, useState } from "react";
@@ -402,6 +402,14 @@ export default function PopupWindow() {
     }
   };
 
+  // Function to clear the conversation
+  const clearConversation = () => {
+    setMessages([]);
+    setScreenshotPreview(null);
+    setFetchError(null);
+    showToast("Conversation cleared");
+  };
+
   // Effect to set up event listeners
   useEffect(() => {
     let unlistenChunk: (() => void) | undefined;
@@ -522,18 +530,29 @@ export default function PopupWindow() {
               >
                 Zen Chat
               </h1>
-              <Button
-                onClick={() =>
-                  invoke("close_popup_window").catch(console.error)
-                }
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7 rounded-full transition-colors duration-300"
-                style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
-              >
-                <X className="h-4 w-4" />
-                <span className="sr-only">Close</span>
-              </Button>
+              <div className="flex items-center gap-2" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
+                <Button
+                  onClick={clearConversation}
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 rounded-full transition-colors duration-300"
+                  title="Clear conversation"
+                >
+                  <Trash className="h-4 w-4" />
+                  <span className="sr-only">Clear conversation</span>
+                </Button>
+                <Button
+                  onClick={() =>
+                    invoke("close_popup_window").catch(console.error)
+                  }
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 rounded-full transition-colors duration-300"
+                >
+                  <X className="h-4 w-4" />
+                  <span className="sr-only">Close</span>
+                </Button>
+              </div>
             </div>
           </div>
 
