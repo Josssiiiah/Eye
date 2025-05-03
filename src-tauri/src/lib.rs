@@ -141,7 +141,17 @@ async fn chat_mastra<R: Runtime>(
         if let Some(start_idx) = prompt.find("data:image/") {
             if let Some(end_idx) = prompt[start_idx..].find(")") {
                 let full_image_url = &prompt[start_idx..start_idx + end_idx];
-                image_url = Some(full_image_url.to_string());
+                
+                // Validate image URL before using it
+                if !full_image_url.is_empty() && full_image_url.contains("base64,") {
+                    // Check if there's actual image data after the base64 prefix
+                    let parts: Vec<&str> = full_image_url.split("base64,").collect();
+                    if parts.len() > 1 && !parts[1].is_empty() {
+                        image_url = Some(full_image_url.to_string());
+                    } else {
+                        println!("Warning: Empty base64 image data detected and skipped");
+                    }
+                }
                 
                 // Remove the image markdown from the prompt
                 prompt.replace(&format!("![Screenshot]({})", full_image_url), "")
