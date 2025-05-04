@@ -18,25 +18,38 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api"] }
-tauri-plugin-sql = { version = "2.0.0-beta", features = ["sqlite"] }
-tauri-plugin-opener = "2"
-tauri-plugin-os = "2"
+tauri = { version = "2.0.0-beta", features = ["tray-icon", "macos-private-api", "unstable", "wry", "devtools"] }
+tauri-plugin-sql = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v2", features = ["sqlite"] }
+tauri-plugin-opener = "2.0.0-beta"
+tauri-plugin-os = "2.0.0-beta"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 window-vibrancy = "0.6.0"
-tauri-plugin-clipboard-manager = "2.2.2"
-tokio = { version = "1", features = ["rt-multi-thread"] }
-tokio-stream = "0.1"
-bytes = "1.5"
-openai-rust = "1"
-dotenvy = "0.15"
-reqwest = { version = "0.12", features = ["json", "stream"] }
-tauri-plugin-screenshots = "2.2.0"
-tauri-plugin-macos-permissions = "2.2.0"
-tauri-plugin-fs = "2.2.1"
+tauri-plugin-clipboard-manager = "2.0.0-beta"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1.15"
+bytes = "1.6.0"
+openai-rust = "0.3.0"
+dotenvy = "0.15.7"
+reqwest = { version = "0.12.4", features = ["json", "stream"] }
+tauri-plugin-screenshots = "2.0.0-beta.4"
+tauri-plugin-macos-permissions = "2.0.0-beta"
+tauri-plugin-fs = "2.0.0-beta"
+base64 = "0.22.1"
 
 # Platform-specific dependencies
 [target."cfg(target_os = \"macos\")".dependencies]
 cocoa = "0.25"
+
+# Add AWS SDK dependencies for R2 (S3 compatible)
+aws-config = { version = "1.1.9", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.20.0"
+http-body = "1.0.0"
+uuid = { version = "1.8.0", features = ["v4"] }
+anyhow = "1.0"
+
+[features]
+# this feature is used used for production builds or when `devPath` points to the filesystem
+# DO NOT REMOVE!!
+custom-protocol = [ "tauri/custom-protocol" ]
 

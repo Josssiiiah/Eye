@@ -6,7 +6,17 @@ use serde::{Deserialize, Serialize};
 use reqwest;
 use tokio_stream::StreamExt;
 use reqwest::Response;
-use bytes::Bytes;
+use std::path::Path;
+use uuid::Uuid;
+use std::time::Duration; // Import Duration for presigning
+
+// AWS / R2 Imports
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::config::Region;
+use aws_sdk_s3::presigning::PresigningConfig; // Import PresigningConfig
+use anyhow::{anyhow, Context}; // Import anyhow and Context
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -14,8 +24,32 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
-// Define a struct to match the message format expected by openai_rust and useChat
-#[derive(Serialize, Deserialize, Debug, Clone)] // Add Clone
+// Define a struct for the image URL content part
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ImageUrlContent {
+    #[serde(rename = "type")]
+    type_field: String,
+    image: String,
+}
+
+// Define a struct for the text content part
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct TextContent {
+    #[serde(rename = "type")]
+    type_field: String,
+    text: String,
+}
+
+// Define a union enum for different content types if needed, or use serde_json::Value
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum ContentPart {
+    Text(TextContent),
+    ImageUrl(ImageUrlContent),
+}
+
+// Update ChatMessage to use ContentPart for flexibility
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct ChatMessage {
     role: String,
     content: String,
@@ -127,89 +161,72 @@ async fn chat(prompt: String, messages_history: Vec<ChatMessage>) -> std::result
 async fn chat_mastra<R: Runtime>(
     prompt: String,
     messages_history: Vec<ChatMessage>,
+    image_url: Option<String>,
     app: AppHandle<R>,
 ) -> std::result::Result<(), String> {
-    // Change endpoint from generate to stream
     let mastra_endpoint = "http://localhost:4111/api/agents/weatherAgent/stream";
     let client = reqwest::Client::new();
 
-    let mut messages_to_send = messages_history;
-    
-    // Check if the prompt contains an image (markdown format: ![alt](data:image/png;base64,...))
-    let mut image_url = None;
-    let prompt_text = if prompt.contains("![Screenshot](data:image/") {
-        // Extract the base64 image data
-        if let Some(start_idx) = prompt.find("data:image/") {
-            if let Some(end_idx) = prompt[start_idx..].find(")") {
-                let full_image_url = &prompt[start_idx..start_idx + end_idx];
-                
-                // Validate image URL before using it
-                if !full_image_url.is_empty() && full_image_url.contains("base64,") {
-                    // Check if there's actual image data after the base64 prefix
-                    let parts: Vec<&str> = full_image_url.split("base64,").collect();
-                    if parts.len() > 1 && !parts[1].is_empty() {
-                        image_url = Some(full_image_url.to_string());
-                    } else {
-                        println!("Warning: Empty base64 image data detected and skipped");
-                    }
-                }
-                
-                // Remove the image markdown from the prompt
-                prompt.replace(&format!("![Screenshot]({})", full_image_url), "")
-                    .trim()
-                    .to_string()
-            } else {
-                prompt
-            }
-        } else {
-            prompt
-        }
-    } else {
-        prompt
-    };
-    
-    // Add the user message, potentially with an image
-    messages_to_send.push(ChatMessage { 
-        role: "user".to_string(), 
-        content: prompt_text,
-        image_url,
-    });
+    // Start constructing the messages payload for Mastra
+    let mut final_messages_payload: Vec<serde_json::Value> = Vec::new();
 
-    // Format messages for Mastra's API format - exactly like the bird-checker example 
-    let formatted_messages = messages_to_send.iter().map(|msg| {
-        let mut content_array = Vec::new();
-        
-        // Add image if present (should come first based on examples)
-        if let Some(img_url) = &msg.image_url {
-            content_array.push(serde_json::json!({
-                "type": "image",
-                "image": img_url,
-                "detail": "low"  // Set to "low" to save tokens and speed up responses
-            }));
-        }
-        
-        // Add text content
-        content_array.push(serde_json::json!({
-            "type": "text",
-            "text": msg.content
-        }));
-        
-        serde_json::json!({
+    // Process history messages (assuming simple text content for now)
+    for msg in messages_history {
+        final_messages_payload.push(serde_json::json!({
             "role": msg.role,
-            "content": content_array
-        })
-    }).collect::<Vec<_>>();
+            "content": [{ "type": "text", "text": msg.content }]
+        }));
+    }
+
+    // Construct the current user message payload
+    let mut current_user_content: Vec<ContentPart> = Vec::new();
+
+    // Add text part if prompt is not empty
+    if !prompt.trim().is_empty() {
+        current_user_content.push(ContentPart::Text(TextContent {
+            type_field: "text".to_string(),
+            text: prompt.trim().to_string(),
+        }));
+    }
+
+    // Add image URL part if provided (now expects a pre-signed URL)
+    if let Some(url) = image_url {
+         println!("Image URL received in chat_mastra: {}", url); // Debugging
+        // Basic validation for URL format might still be useful, but R2 presigned URLs are complex
+        if url.starts_with("https://") {
+            current_user_content.push(ContentPart::ImageUrl(ImageUrlContent {
+                type_field: "image".to_string(),
+                image: url,
+            }));
+        } else {
+            eprintln!("Warning: Provided image_url does not look like a secure pre-signed URL: {}", url);
+            // Decide if you want to proceed or error out if the URL is not HTTPS
+        }
+    }
+
+    // Add the fully constructed user message to the payload
+    if !current_user_content.is_empty() {
+        final_messages_payload.push(serde_json::json!({
+            "role": "user",
+            "content": current_user_content
+        }));
+    } else {
+        // Allow sending empty text prompt if an image URL *is* provided
+        if final_messages_payload.iter().any(|m| m["role"] == "user" && m["content"].as_array().map_or(false, |c| c.iter().any(|p| p["type"] == "image_url"))) {
+             println!("Sending message with only image.");
+        } else {
+             return Err("Cannot send an empty message without an image.".to_string());
+        }
+    }
+
 
     // Prepare request body according to Mastra stream API
     let request_body = serde_json::json!({
-        "messages": formatted_messages,
-        // No need to explicitly set stream:true for the stream endpoint
+        "messages": final_messages_payload,
     });
 
-    println!("Sending request to Mastra stream API. Message format:");
-    for (i, msg) in formatted_messages.iter().enumerate() {
-        println!("Message {}: {}", i, serde_json::to_string_pretty(msg).unwrap_or_default());
-    }
+    println!("Sending request to Mastra stream API. Payload:");
+    println!("{}", serde_json::to_string_pretty(&request_body).unwrap_or_default());
 
     // Ensure the popup window exists before proceeding
     let window = app.get_webview_window("popup").ok_or_else(|| "Popup window not found".to_string())?;
@@ -235,7 +252,6 @@ async fn chat_mastra<R: Runtime>(
     // Process the stream - use the stream method available in reqwest with tokio_stream
     let mut stream = res.bytes_stream();
     let mut buffer = String::new();
-    let mut has_emitted = false; // Track if we've emitted any content
 
     while let Some(item) = stream.next().await {
         match item {
@@ -243,26 +259,26 @@ async fn chat_mastra<R: Runtime>(
                 // Convert the bytes to a string
                 let chunk_str = String::from_utf8_lossy(&chunk_bytes).to_string();
                 println!("Raw chunk: {}", chunk_str); // Debug logging
-                
+
                 // Append to our buffer
                 buffer.push_str(&chunk_str);
-                
+
                 // Process any complete lines - Mastra uses a custom format
-                while let Some(pos) = buffer.find('\n') {
+                while let Some(pos) = buffer.find("\n") {
                     let line = buffer[..pos].trim().to_string();
                     buffer = buffer[pos + 1..].to_string();
-                    
+
                     // Skip empty lines
                     if line.is_empty() {
                         continue;
                     }
-                    
+
                     // Parse the Mastra streaming format with different prefixes
                     // Format appears to be: prefix:content where prefix is f, 0, e, or d
                     if line.len() >= 2 && line.chars().nth(1) == Some(':') {
                         let prefix = line.chars().next().unwrap_or('?');
                         let content = &line[2..];
-                        
+
                         match prefix {
                             'f' => {
                                 // First message, typically contains messageId
@@ -276,7 +292,6 @@ async fn chat_mastra<R: Runtime>(
                                     if let Some(text) = content_json.as_str() {
                                         println!("Emitting text chunk: {}", text);
                                         window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
-                                        has_emitted = true;
                                     }
                                 } else {
                                     // If not valid JSON, just emit the raw content without the quotes
@@ -285,7 +300,6 @@ async fn chat_mastra<R: Runtime>(
                                         let clean_content = &content[1..content.len()-1];
                                         println!("Emitting cleaned text chunk: {}", clean_content);
                                         window.emit("chat_chunk", clean_content).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
-                                        has_emitted = true;
                                     }
                                 }
                             },
@@ -293,6 +307,17 @@ async fn chat_mastra<R: Runtime>(
                                 // End message or Done message
                                 println!("Stream end marker: {} - {}", prefix, content);
                                 // No need to emit this directly
+                            },
+                            '3' => {
+                                // Error message
+                                println!("Error message: {}", content);
+                                // Strip quotes if present in error message
+                                let error_content = if content.starts_with('"') && content.ends_with('"') && content.len() >= 2 {
+                                    &content[1..content.len()-1]
+                                } else {
+                                    content
+                                };
+                                window.emit("chat_stream_error", error_content).map_err(|e| format!("Failed to emit error: {}", e))?;
                             },
                             _ => {
                                 // Unknown prefix, try to extract useful content
@@ -302,23 +327,21 @@ async fn chat_mastra<R: Runtime>(
                     } else if line.starts_with("data: ") {
                         // Handle standard SSE format as fallback
                         let data = &line[6..]; // Skip "data: " prefix
-                        
+
                         if data == "[DONE]" {
                             println!("Stream complete marker received");
                             continue;
                         }
-                        
+
                         // Try to parse data content
                         if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(data) {
                             if let Some(text) = json_value.get("text").and_then(|t| t.as_str()) {
                                 println!("Emitting SSE chunk: {}", text);
                                 window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
-                                has_emitted = true;
                             }
                         } else if !data.is_empty() {
                             println!("Emitting raw SSE data: {}", data);
                             window.emit("chat_chunk", data).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
-                            has_emitted = true;
                         }
                     }
                 }
@@ -340,6 +363,109 @@ async fn chat_mastra<R: Runtime>(
     Ok(()) // Return Ok(()) as the stream finished successfully
 }
 // --- /MODIFIED COMMAND ---
+
+// Define the structure for the return value
+#[derive(Serialize)]
+struct UploadResult {
+    key: String,
+    url: String,
+}
+
+// --- R2 Upload Command ---
+#[tauri::command]
+// Modify the return type to use the UploadResult struct
+async fn upload_image_to_r2(file_path: String) -> tauri::Result<UploadResult> {
+    println!("Attempting to upload image from path: {}", file_path);
+
+    // Load R2 configuration from environment variables, map errors to anyhow::Error
+    let account_id = env::var("R2_ACCOUNT_ID")
+        .map_err(|e| anyhow!("R2_ACCOUNT_ID not set: {}", e))?;
+    let access_key_id = env::var("R2_ACCESS_KEY_ID")
+        .map_err(|e| anyhow!("R2_ACCESS_KEY_ID not set: {}", e))?;
+    let secret_access_key = env::var("R2_SECRET_ACCESS_KEY")
+        .map_err(|e| anyhow!("R2_SECRET_ACCESS_KEY not set: {}", e))?;
+    let bucket_name = env::var("R2_BUCKET_NAME")
+        .map_err(|e| anyhow!("R2_BUCKET_NAME not set: {}", e))?;
+
+    // Construct the R2 endpoint URL
+    let endpoint_url = format!("https://{}.r2.cloudflarestorage.com", account_id);
+    println!("Using R2 endpoint: {}", endpoint_url);
+
+    // Configure AWS SDK
+    let region_provider = RegionProviderChain::first_try(Region::new("auto")); // R2 specific region
+    let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(region_provider)
+        .endpoint_url(endpoint_url.clone()) // Clone endpoint_url for use here
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
+            &access_key_id,
+            &secret_access_key,
+            None, // session token
+            None, // expiry
+            "cloudflare-r2-provider", // provider name
+        ))
+        .load()
+        .await;
+
+    let client = S3Client::new(&shared_config);
+
+    // Generate a unique key (filename) for the R2 object
+    let file_stem = Path::new(&file_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("upload");
+    let extension = Path::new(&file_path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("png"); // Default to png if no extension
+    let key = format!("{}-{}.{}", file_stem, Uuid::new_v4(), extension);
+    println!("Generated R2 key: {}", key);
+
+
+    // Create ByteStream from the file path, map error to anyhow::Error
+    let body = ByteStream::from_path(Path::new(&file_path))
+        .await
+        .map_err(|e| anyhow!("Failed to read file '{}' for upload: {}", file_path, e))?;
+
+    // Upload to R2
+    println!("Uploading to bucket: {}", bucket_name);
+    let put_object_output = client.put_object()
+        .bucket(&bucket_name)
+        .key(&key)
+        // Consider adding content type if known, e.g., .content_type("image/png")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| {
+             let sdk_error = e.into_service_error();
+             let error_message = format!("Failed to upload to R2: {:?}", sdk_error);
+             eprintln!("{}", error_message);
+             anyhow!(error_message) // Convert SdkError to anyhow::Error
+        })?;
+
+    println!("Successfully uploaded {} to R2 bucket {}", key, bucket_name);
+
+    // Generate pre-signed URL after successful upload
+    let presigning_config = PresigningConfig::expires_in(Duration::from_secs(3600)) // e.g., 1 hour validity
+        .context("Failed to create presigning config")?; // Use anyhow::Context for better error
+
+    println!("Generating pre-signed URL for key: {}", key);
+    let presigned_request = client.get_object()
+        .bucket(&bucket_name)
+        .key(&key)
+        .presigned(presigning_config)
+        .await
+        .context("Failed to generate pre-signed URL")?; // Use anyhow::Context
+
+    let presigned_url = presigned_request.uri().to_string();
+    println!("Generated pre-signed URL: {}", presigned_url);
+
+    // Return both the key and the URL
+    Ok(UploadResult {
+        key,
+        url: presigned_url,
+    })
+}
+// --- /R2 Upload Command ---
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -377,6 +503,7 @@ pub fn run() {
             open_popup_window,
             close_popup_window,
             chat,
+            upload_image_to_r2,
             chat_mastra
         ])
         // Add setup to ensure AppHandle is available for chat_mastra
@@ -386,7 +513,7 @@ pub fn run() {
             {
                 use tauri_plugin_fs::FsExt;
                 let scope = app.fs_scope();
-                scope.allow_directory("/Users/josiah/Library/Application Support/com.zen.app/tauri-plugin-screenshots", true);
+                let _ = scope.allow_directory("/Users/josiah/Library/Application Support/com.zen.app/tauri-plugin-screenshots", true);
             }
             Ok(())
         })

@@ -1,12 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { X, Camera, Download, Check, Trash } from "lucide-react";
+import { X, Camera, Download, Check, Trash, UploadCloud } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { useEffect, useCallback, useRef, FormEvent, useState } from "react";
 import { cn } from "../lib/utils";
 import { motion, AnimatePresence } from "framer-motion";
 import { useChat, Message } from "@ai-sdk/react";
+import { v4 as uuidv4 } from "uuid";
 import {
   getScreenshotableMonitors,
   getMonitorScreenshot,
@@ -18,6 +19,12 @@ import {
 import { readFile, BaseDirectory, writeFile } from "@tauri-apps/plugin-fs";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { desktopDir } from "@tauri-apps/api/path";
+
+// Define the expected structure from the Rust backend
+interface UploadResult {
+  key: string;
+  url: string;
+}
 
 export default function PopupWindow() {
   // Initialize useChat - only for state management (messages, input, setInput, setMessages)
@@ -36,10 +43,16 @@ export default function PopupWindow() {
   ); // Track current assistant message ID
   const [screenshotPreview, setScreenshotPreview] = useState<string | null>(
     null
-  ); // For preview
+  ); // For preview (base64)
+  const [screenshotPath, setScreenshotPath] = useState<string | null>(null); // Path to original screenshot file
+  const [lastUploadedR2Key, setLastUploadedR2Key] = useState<string | null>(
+    null
+  ); // Key of last successful upload
+  const [presignedUrl, setPresignedUrl] = useState<string | null>(null); // *** Add state for pre-signed URL ***
+  const [isUploading, setIsUploading] = useState(false); // Upload specific loading state
   const [lastScreenshotPath, setLastScreenshotPath] = useState<string | null>(
     null
-  ); // Path to saved screenshot
+  ); // Path to saved screenshot on desktop
   const [toast, setToast] = useState<{
     message: string;
     type: "success" | "error";
@@ -54,203 +67,206 @@ export default function PopupWindow() {
     setTimeout(() => setToast(null), 3000);
   };
 
-  // Parse messages to properly render images
+  // Modify the renderMessageContent function to better handle images within messages
   const renderMessageContent = (content: string) => {
-    // Check if the content contains an image markdown
-    const imageRegex = /!\[Screenshot\]\((data:image\/[^)]+)\)/;
-    const match = content.match(imageRegex);
+    // Check for image directly embedded in the content (new format)
+    const directImageRegex = /\!\[Screenshot\]\((data:image\/[^)]+)\)/;
+    const directMatch = content.match(directImageRegex);
 
-    if (match && match[1]) {
-      // Extract the base64 image URL
-      const imageUrl = match[1];
-      // Replace the markdown with an actual image element
-      const textWithoutImage = content.replace(imageRegex, "").trim();
-
+    if (directMatch && directMatch[1]) {
+      const imageUrl = directMatch[1];
+      const textWithoutImage = content.replace(directImageRegex, "").trim();
       return (
         <>
           {textWithoutImage && <p className="mb-2">{textWithoutImage}</p>}
+          <img
+            src={imageUrl}
+            alt="Screenshot"
+            className="max-w-full rounded-md border border-border/30 mt-2"
+            style={{ maxHeight: "300px" }}
+          />
+        </>
+      );
+    }
+
+    // Legacy support for "local_preview" placeholder - only works when screenshotPreview is available
+    if (
+      content.includes("![Screenshot Preview](local_preview)") &&
+      screenshotPreview
+    ) {
+      const textWithoutPlaceholder = content
+        .replace("![Screenshot Preview](local_preview)", "")
+        .trim();
+      return (
+        <>
+          {textWithoutPlaceholder && (
+            <p className="mb-2">{textWithoutPlaceholder}</p>
+          )}
           <div className="relative group">
             <img
-              src={imageUrl}
-              alt="Screenshot"
+              src={screenshotPreview}
+              alt="Screenshot Preview"
               className="max-w-full rounded-md border border-border/30 mt-2"
               style={{ maxHeight: "300px" }}
             />
+            <div className="absolute inset-0 bg-black/20 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity rounded-md">
+              <span className="text-white text-xs font-bold bg-black/50 px-2 py-1 rounded">
+                PREVIEW
+              </span>
+            </div>
           </div>
         </>
       );
     }
 
-    // Just return the text if no image
+    // Just return text if no image
     return content;
   };
 
-  // Custom handler to initiate streaming via Tauri command
+  // Modify handleSendMessage function to clear the screenshot preview after sending
   const handleSendMessage = async () => {
-    if (!input.trim() && !screenshotPreview) return;
+    // Check if there's text input OR a screenshot key available
+    if (!input.trim() && !lastUploadedR2Key) return;
     if (isProcessing) return;
 
+    // Use the pre-signed URL from state if available
+    if (!input.trim() && !presignedUrl) {
+      console.log("Send aborted: No text input and no pre-signed URL.");
+      return;
+    }
+
+    setIsProcessing(true); // Still use isProcessing for the overall send operation
+    setFetchError(null);
+
+    let signedImageUrl: string | null = presignedUrl; // *** Use pre-signed URL from state ***
+    let userPromptContent = input.trim();
+    let keyToClear: string | null = lastUploadedR2Key; // Store key to clear later
+    let urlToClear: string | null = presignedUrl; // Store URL to clear later
+    let imagePreviewToEmbed: string | null = screenshotPreview; // Store the current preview
+
     try {
-      // Validate screenshot if present
-      if (screenshotPreview) {
-        if (
-          !screenshotPreview.startsWith("data:image/") ||
-          !screenshotPreview.includes("base64,")
-        ) {
-          throw new Error("Invalid image format in preview");
-        }
-
-        const [_, base64Data] = screenshotPreview.split("base64,");
-        if (!base64Data || base64Data.trim().length === 0) {
-          throw new Error("Screenshot contains no image data");
-        }
-      }
-
-      // Combine text input with screenshot if there's a preview
-      const combinedInput = screenshotPreview
-        ? `${
-            input.trim() ? input + "\n" : ""
-          }![Screenshot](${screenshotPreview})`
-        : input;
-
+      // 1. Prepare message for local display
       const newUserMessage: Message = {
         id: crypto.randomUUID(),
         role: "user" as const,
-        content: combinedInput,
+        // CHANGE: If we have a screenshot, embed it directly as image data
+        content: imagePreviewToEmbed
+          ? `${
+              userPromptContent ? userPromptContent + "\n" : ""
+            }![Screenshot](${imagePreviewToEmbed})`
+          : userPromptContent,
       };
 
-      // Add user message and a placeholder for assistant response
+      // Add user message & placeholder assistant message
       const placeholderId = crypto.randomUUID();
       const placeholderAssistantMessage: Message = {
         id: placeholderId,
         role: "assistant" as const,
-        content: "", // Start with empty content
+        content: "",
       };
-
       setMessages([...messages, newUserMessage, placeholderAssistantMessage]);
-      setAssistantMessageId(placeholderId); // Track the ID of the message we'll update
+      setAssistantMessageId(placeholderId);
+
+      // Clear input state *now*
       setInput("");
-      setScreenshotPreview(null); // Clear the preview after sending
-      setIsProcessing(true);
-      setFetchError(null);
 
-      // Prepare history *excluding* the placeholder assistant message
-      const historyForBackend = [...messages, newUserMessage].map(
-        ({ id, ...rest }) => rest
-      );
+      // 2. Prepare history for backend (strip preview placeholder)
+      const historyForBackend = [...messages]
+        .filter(
+          (msg) =>
+            msg && typeof msg === "object" && "role" in msg && "content" in msg
+        )
+        .map(({ role, content }) => ({
+          role: role,
+          content:
+            typeof content === "string"
+              ? content
+                  .replace(/\!\[Screenshot\]\(data:image\/[^)]+\)/, "")
+                  .trim()
+              : "",
+        }));
 
-      try {
-        // Invoke the Rust command which will start emitting events
-        // It now returns () on success or throws an error if setup fails
-        await invoke("chat_mastra", {
-          prompt: combinedInput,
-          messagesHistory: historyForBackend,
-        });
-        // Don't update messages here directly, wait for events
-        if (promptInputRef.current) {
-          promptInputRef.current.focus();
-        }
-      } catch (err: any) {
-        console.error("Failed to initiate chat stream:", err);
-        let errorMessage = "Failed to start chat.";
-        if (typeof err === "string") {
-          errorMessage = err;
-        } else if (err instanceof Error) {
-          errorMessage = err.message;
-        }
-        setFetchError(errorMessage);
-        // Remove placeholder on initial invoke error
-        setMessages((currentMessages) => currentMessages.slice(0, -1));
-        setIsProcessing(false);
-        setAssistantMessageId(null);
+      // 3. Invoke the Rust command with the pre-signed URL from state
+      console.log("Invoking chat_mastra with prompt and URL:", signedImageUrl);
+      await invoke("chat_mastra", {
+        prompt: userPromptContent,
+        messagesHistory: historyForBackend,
+        imageUrl: signedImageUrl, // Pass the pre-signed URL from state (or null)
+      });
+
+      // 4. Clear preview state AFTER successful invocation
+      if (keyToClear) {
+        setLastUploadedR2Key(null);
+        console.log("Cleared last uploaded R2 key:", keyToClear);
       }
-    } catch (err) {
-      console.error("Message validation error:", err);
-      let errorMessage = err instanceof Error ? err.message : String(err);
-      showToast(errorMessage, "error");
+      if (urlToClear) {
+        setPresignedUrl(null);
+        console.log("Cleared pre-signed URL.");
+        // Clear the standalone preview but the image data is already in the message content
+        setScreenshotPreview(null);
+        setScreenshotPath(null);
+      }
+
+      // Focus input after successful invocation start
+      if (promptInputRef.current) {
+        promptInputRef.current.focus();
+      }
+    } catch (err: any) {
+      console.error("Error during send message flow:", err);
+      let errorMessage = "Failed to send message.";
+      if (typeof err === "string") {
+        errorMessage = err;
+      } else if (err instanceof Error) {
+        errorMessage = err.message;
+      }
       setFetchError(errorMessage);
+      showToast(errorMessage, "error");
+      setMessages((currentMessages) => currentMessages.slice(0, -2));
+      setIsProcessing(false);
+      setAssistantMessageId(null);
     }
-    // Note: setIsProcessing(false) will be handled by stream end/error events
+    // Note: setIsProcessing(false) is handled by stream end/error events
   };
 
-  // Function to save screenshot to desktop
+  // Function to save ORIGINAL screenshot to desktop (using path)
   const saveScreenshotToDesktop = async () => {
-    if (!screenshotPreview) return null;
+    if (!screenshotPath) return null; // Check path now
 
     try {
-      // Validate screenshot preview format
-      if (
-        !screenshotPreview.startsWith("data:image/") ||
-        !screenshotPreview.includes("base64,")
-      ) {
-        throw new Error("Invalid image format");
+      // Get desktop directory path
+      const desktopPath = await desktopDir();
+      const timestamp = new Date()
+        .toISOString()
+        .replace(/:/g, "-")
+        .replace(/\.\.+/, "");
+      // Use original file extension if possible, default to png
+      const fileExtension = screenshotPath.split(".").pop() || "png";
+      const fileName = `zen-screenshot-${timestamp}.${fileExtension}`;
+      const destinationPath = `${desktopPath}${fileName}`;
+
+      // Read the original file
+      const bytes = await readFile(screenshotPath); // Read original path
+
+      if (!bytes || bytes.length === 0) {
+        throw new Error(
+          "Original screenshot file is empty or could not be read"
+        );
       }
 
-      // Extract MIME type and base64 data
-      const [mimeHeader, base64Data] = screenshotPreview.split("base64,");
-      if (!base64Data || base64Data.trim().length === 0) {
-        throw new Error("Empty image data");
-      }
+      // Write file to disk
+      await writeFile(destinationPath, bytes);
 
-      // Get file extension from MIME type
-      const mimeType = mimeHeader.split(":")[1].split(";")[0];
-      const fileExtension = mimeType === "image/png" ? "png" : "jpg";
+      // Verify file was written (optional but good practice)
+      // ... (verification logic can be added here if needed)
 
-      // Convert base64 to Uint8Array safely
-      try {
-        const binaryString = window.atob(base64Data);
-        if (binaryString.length === 0) {
-          throw new Error("Decoded binary data is empty");
-        }
+      setLastScreenshotPath(destinationPath); // Store path to the *saved* file
 
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
+      showToast(`Screenshot saved to desktop`);
+      console.log(`Screenshot saved to ${destinationPath}`);
 
-        if (bytes.length === 0) {
-          throw new Error("Byte array is empty");
-        }
-
-        // Get desktop directory path
-        const desktopPath = await desktopDir();
-        const timestamp = new Date()
-          .toISOString()
-          .replace(/:/g, "-")
-          .replace(/\..+/, "");
-        const fileName = `zen-screenshot-${timestamp}.${fileExtension}`;
-        const filePath = `${desktopPath}${fileName}`;
-
-        // Write file to disk
-        await writeFile(filePath, bytes);
-
-        // Verify file was written successfully
-        try {
-          const fileCheck = await readFile(filePath);
-          if (!fileCheck || fileCheck.length === 0) {
-            throw new Error("File was written but appears to be empty");
-          }
-        } catch (error) {
-          console.error("Error verifying file:", error);
-          throw new Error(
-            "Failed to verify screenshot file was saved correctly"
-          );
-        }
-
-        setLastScreenshotPath(filePath);
-
-        // Show toast notification
-        showToast(`Screenshot saved to desktop`);
-        console.log(`Screenshot saved to ${filePath}`);
-
-        // Return the path for potential use
-        return filePath;
-      } catch (error) {
-        console.error("Binary data conversion error:", error);
-        throw new Error("Failed to process image data");
-      }
+      return destinationPath;
     } catch (error) {
-      console.error("Failed to save screenshot:", error);
+      console.error("Failed to save original screenshot:", error);
       showToast("Failed to save screenshot to desktop", "error");
       setFetchError(
         `Failed to save screenshot: ${
@@ -261,40 +277,48 @@ export default function PopupWindow() {
     }
   };
 
-  // Handler for screenshot capture
+  // Handler for screenshot capture - NOW includes upload
   const handleCaptureScreenshot = async () => {
+    // Prevent capturing if already uploading or processing a message
+    if (isUploading || isProcessing) return;
+
+    setCapturing(true);
+    setIsUploading(true); // Indicate upload process starting
+    setScreenshotPreview(null);
+    setScreenshotPath(null);
+    setLastUploadedR2Key(null); // Clear previous key
+    setPresignedUrl(null); // *** Clear previous pre-signed URL ***
+    setFetchError(null);
+
+    let originalPngPath: string | null = null;
+
     try {
-      setCapturing(true);
-      // 1. Permission dance for macOS
+      // 1. Permission Check (same as before)
       const hasPerm = await checkScreenRecordingPermission();
       if (!hasPerm) {
         const granted = await requestScreenRecordingPermission();
         if (!granted) {
           showToast("Screen recording permission denied", "error");
           setFetchError("Screen recording permission denied");
+          setCapturing(false);
+          setIsUploading(false); // Ensure upload state is reset on permission denial
           return;
         }
         // User must re-click after granting; exit early
         setCapturing(false);
+        setIsUploading(false); // Ensure upload state is reset on permission denial
         return;
       }
 
-      // 2. Choose the primary monitor (index 0)
+      // 2. Capture Screenshot (same as before)
       const monitors = await getScreenshotableMonitors();
-      if (monitors.length === 0) {
-        throw new Error("No monitor detected");
-      }
-      const pngPath = await getMonitorScreenshot(monitors[0].id);
+      if (monitors.length === 0) throw new Error("No monitor detected");
+      originalPngPath = await getMonitorScreenshot(monitors[0].id);
+      setScreenshotPath(originalPngPath); // Store path
+      console.log("Screenshot captured:", originalPngPath);
 
-      // 3. Read the file as binary using the plugin-fs API
-      const imgBinary = await readFile(pngPath);
-
-      // Validate the imgBinary is not empty
-      if (!imgBinary || imgBinary.length === 0) {
-        throw new Error("Screenshot resulted in empty image data");
-      }
-
-      // 4. Create an image element to resize it
+      // 3. Generate Preview (same as before)
+      const imgBinary = await readFile(originalPngPath);
       const resizeImage = (imgBuffer: Uint8Array): Promise<string | null> => {
         return new Promise((resolve) => {
           try {
@@ -363,29 +387,56 @@ export default function PopupWindow() {
           }
         });
       };
+      const base64Preview = await resizeImage(imgBinary);
+      if (!base64Preview)
+        throw new Error("Failed to process screenshot preview");
+      setScreenshotPreview(base64Preview);
+      console.log("Preview generated.");
 
-      // 5. Resize the image and get base64
-      const base64Image = await resizeImage(imgBinary);
+      // 4. **Upload Immediately and get key + pre-signed URL**
+      console.log(`Uploading ${originalPngPath} immediately...`);
+      // *** Update invoke call to expect UploadResult ***
+      const uploadResult = await invoke<UploadResult>("upload_image_to_r2", {
+        filePath: originalPngPath,
+      });
+      setLastUploadedR2Key(uploadResult.key);
+      setPresignedUrl(uploadResult.url); // *** Store the pre-signed URL ***
+      console.log("Uploaded to R2, key:", uploadResult.key);
+      console.log("Received pre-signed URL:", uploadResult.url);
+      showToast(`Screenshot captured and uploaded!`); // Update toast message
 
-      if (!base64Image) {
-        throw new Error("Failed to process screenshot");
-      }
-
-      // 6. Store the preview directly instead of adding to the input right away
-      setScreenshotPreview(base64Image);
-
-      // 7. Save a copy of the screenshot automatically
+      // 5. Save Local Copy (same as before)
       await saveScreenshotToDesktop();
 
+      // Focus input
       if (promptInputRef.current) {
         promptInputRef.current.focus();
       }
     } catch (err) {
-      console.error("Screenshot error:", err);
-      showToast(String(err), "error");
+      console.error("Error during capture/upload:", err);
+      showToast(
+        `Capture/Upload failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        "error"
+      );
       setFetchError(String(err));
+      // Clear potentially inconsistent state on error
+      setScreenshotPreview(null);
+      setScreenshotPath(null);
+      setLastUploadedR2Key(null);
+      setPresignedUrl(null); // *** Clear pre-signed URL on error ***
+      if (originalPngPath) {
+        // Try to clean up temp screenshot file if path exists
+        // Note: Tauri FS plugin doesn't have a delete yet, this is a placeholder
+        console.warn(
+          "Need to implement cleanup for temp screenshot:",
+          originalPngPath
+        );
+      }
     } finally {
       setCapturing(false);
+      setIsUploading(false); // Ensure upload state is reset
     }
   };
 
@@ -406,6 +457,9 @@ export default function PopupWindow() {
   const clearConversation = () => {
     setMessages([]);
     setScreenshotPreview(null);
+    setScreenshotPath(null);
+    setLastUploadedR2Key(null); // Clear R2 key too
+    setPresignedUrl(null); // *** Clear pre-signed URL too ***
     setFetchError(null);
     showToast("Conversation cleared");
   };
@@ -470,18 +524,20 @@ export default function PopupWindow() {
       !e.metaKey &&
       !e.ctrlKey &&
       !isProcessing &&
-      (input.trim() || screenshotPreview)
+      (input.trim() || lastUploadedR2Key) && // Check key
+      (input.trim() || presignedUrl) // *** Also check pre-signed URL for sending ***
     ) {
-      e.preventDefault(); // Prevent potential form submission/newline
+      e.preventDefault();
       handleSendMessage();
     }
     if (
       e.key === "Enter" &&
       (e.metaKey || e.ctrlKey) &&
       !isProcessing &&
-      (input.trim() || screenshotPreview)
+      (input.trim() || lastUploadedR2Key) && // Check key
+      (input.trim() || presignedUrl) // *** Also check pre-signed URL for sending ***
     ) {
-      e.preventDefault(); // Prevent potential form submission/newline
+      e.preventDefault();
       handleSendMessage();
     }
   };
@@ -620,10 +676,22 @@ export default function PopupWindow() {
                   </motion.div>
                 )}
               </AnimatePresence>
+
+              {/* Display uploading indicator? Maybe near preview or input */}
+              {isUploading && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="text-xs text-center text-muted-foreground italic mt-2"
+                >
+                  Uploading screenshot...
+                </motion.div>
+              )}
             </div>
 
             {/* Screenshot Preview */}
-            {screenshotPreview && (
+            {screenshotPreview && !isProcessing && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
@@ -640,7 +708,12 @@ export default function PopupWindow() {
                       size="sm"
                       variant="secondary"
                       className="h-7 rounded-full bg-black/70 hover:bg-primary transition-colors"
-                      onClick={() => setScreenshotPreview(null)}
+                      onClick={() => {
+                        setScreenshotPreview(null);
+                        setScreenshotPath(null);
+                        setLastUploadedR2Key(null); // *** Clear R2 key on manual removal ***
+                        setPresignedUrl(null); // *** Clear pre-signed URL on manual removal ***
+                      }}
                     >
                       <X className="h-3 w-3 mr-1" />
                       <span className="text-xs">Remove</span>
@@ -658,7 +731,11 @@ export default function PopupWindow() {
                     )}
                   </div>
                   <p className="text-xs text-center mt-1 text-muted-foreground">
-                    Screenshot captured and saved to desktop
+                    {/* Update text based on whether key exists */}
+                    {lastUploadedR2Key
+                      ? "Screenshot uploaded."
+                      : "Screenshot captured."}
+                    {lastScreenshotPath ? " Saved locally." : ""}
                   </p>
                 </div>
               </motion.div>
@@ -711,7 +788,7 @@ export default function PopupWindow() {
                   onFocus={() => setIsInputFocused(true)}
                   onBlur={() => setIsInputFocused(false)}
                   onKeyDown={handleKeyDown}
-                  disabled={isProcessing} // Disable input based on local state
+                  disabled={isProcessing || isUploading} // Disable input during upload too
                   className={cn(
                     "flex-grow border-0 focus-visible:ring-0 focus-visible:ring-offset-0 h-10 placeholder:text-white/90",
                     isInputFocused ? "text-black" : "text-white",
@@ -722,12 +799,15 @@ export default function PopupWindow() {
                 <Button
                   size="sm"
                   variant="ghost"
-                  disabled={capturing || isProcessing}
+                  disabled={capturing || isUploading || isProcessing} // Disable during capture, upload, or send
                   onClick={handleCaptureScreenshot}
                   className="h-8 w-8 rounded-full px-0 bg-black/70 hover:bg-primary transition-colors shrink-0 flex items-center justify-center"
                 >
+                  {/* Show different spinner/icon based on state */}
                   {capturing ? (
                     <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
+                  ) : isUploading ? (
+                    <UploadCloud className="h-4 w-4 animate-pulse text-blue-400" /> // Upload icon
                   ) : (
                     <Camera className="h-4 w-4" />
                   )}
@@ -738,11 +818,12 @@ export default function PopupWindow() {
                   variant="ghost"
                   onClick={handleSendMessage}
                   disabled={
-                    isProcessing || (!input.trim() && !screenshotPreview)
-                  } // Enable if either input or screenshot
+                    isProcessing ||
+                    isUploading || // Disable during upload
+                    (!input.trim() && !presignedUrl) // *** Disable if no text AND no pre-signed URL ***
+                  }
                   className="h-8 rounded-full px-3 bg-black/70 hover:bg-primary transition-colors shrink-0"
                 >
-                  {/* Show spinner based on local state */}
                   {isProcessing ? (
                     <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
                   ) : (
