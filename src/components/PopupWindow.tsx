@@ -530,7 +530,10 @@ export default function PopupWindow() {
               >
                 Zen Chat
               </h1>
-              <div className="flex items-center gap-2" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
+              <div
+                className="flex items-center gap-2"
+                style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+              >
                 <Button
                   onClick={clearConversation}
                   variant="ghost"

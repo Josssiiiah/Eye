@@ -129,7 +129,8 @@ async fn chat_mastra<R: Runtime>(
     messages_history: Vec<ChatMessage>,
     app: AppHandle<R>,
 ) -> std::result::Result<(), String> {
-    let mastra_endpoint = "http://localhost:4111/api/agents/weatherAgent/generate";
+    // Change endpoint from generate to stream
+    let mastra_endpoint = "http://localhost:4111/api/agents/weatherAgent/stream";
     let client = reqwest::Client::new();
 
     let mut messages_to_send = messages_history;
@@ -199,13 +200,13 @@ async fn chat_mastra<R: Runtime>(
         })
     }).collect::<Vec<_>>();
 
-    // Add "stream": true to the request body
+    // Prepare request body according to Mastra stream API
     let request_body = serde_json::json!({
         "messages": formatted_messages,
-        "stream": true // Request streaming
+        // No need to explicitly set stream:true for the stream endpoint
     });
 
-    println!("Sending request to Mastra. Message format:");
+    println!("Sending request to Mastra stream API. Message format:");
     for (i, msg) in formatted_messages.iter().enumerate() {
         println!("Message {}: {}", i, serde_json::to_string_pretty(msg).unwrap_or_default());
     }
@@ -226,7 +227,7 @@ async fn chat_mastra<R: Runtime>(
     if !status.is_success() {
         let error_text = res.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
         let error_msg = format!("Mastra server returned error ({}): {}", status, error_text);
-         // Emit error event before returning Err
+        // Emit error event before returning Err
         window.emit("chat_stream_error", &error_msg).map_err(|e| format!("Failed to emit error event: {}", e))?;
         return Err(error_msg);
     }
@@ -246,72 +247,78 @@ async fn chat_mastra<R: Runtime>(
                 // Append to our buffer
                 buffer.push_str(&chunk_str);
                 
-                // First, check if the buffer contains a complete JSON object
-                if !has_emitted && buffer.starts_with('{') && buffer.ends_with('}') {
-                    // Try parsing as a complete JSON response
-                    match serde_json::from_str::<serde_json::Value>(&buffer) {
-                        Ok(json_value) => {
-                            if let Some(text) = json_value.get("text").and_then(|t| t.as_str()) {
-                                // Found the text in the top-level object
-                                println!("Emitting complete response: {}", text);
-                                window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
-                                has_emitted = true;
-                            }
-                        },
-                        Err(_) => {
-                            // Not a complete valid JSON, might be streaming - continue to SSE processing
-                        }
-                    }
-                }
-                
-                // Process any complete SSE lines
+                // Process any complete lines - Mastra uses a custom format
                 while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].trim().to_string(); // Create an owned String here
+                    let line = buffer[..pos].trim().to_string();
                     buffer = buffer[pos + 1..].to_string();
                     
-                    // Skip empty lines and comments
-                    if line.is_empty() || line.starts_with(':') {
+                    // Skip empty lines
+                    if line.is_empty() {
                         continue;
                     }
                     
-                    // Check for data prefix and process it
-                    if line.starts_with("data: ") {
+                    // Parse the Mastra streaming format with different prefixes
+                    // Format appears to be: prefix:content where prefix is f, 0, e, or d
+                    if line.len() >= 2 && line.chars().nth(1) == Some(':') {
+                        let prefix = line.chars().next().unwrap_or('?');
+                        let content = &line[2..];
+                        
+                        match prefix {
+                            'f' => {
+                                // First message, typically contains messageId
+                                println!("Message start: {}", content);
+                                // No need to emit this part
+                            },
+                            '0' => {
+                                // Text content chunk
+                                // Parse the string content - it should be JSON encoded
+                                if let Ok(content_json) = serde_json::from_str::<serde_json::Value>(content) {
+                                    if let Some(text) = content_json.as_str() {
+                                        println!("Emitting text chunk: {}", text);
+                                        window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                        has_emitted = true;
+                                    }
+                                } else {
+                                    // If not valid JSON, just emit the raw content without the quotes
+                                    // This is a fallback but shouldn't normally be needed
+                                    if content.starts_with('"') && content.ends_with('"') && content.len() >= 2 {
+                                        let clean_content = &content[1..content.len()-1];
+                                        println!("Emitting cleaned text chunk: {}", clean_content);
+                                        window.emit("chat_chunk", clean_content).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                        has_emitted = true;
+                                    }
+                                }
+                            },
+                            'e' | 'd' => {
+                                // End message or Done message
+                                println!("Stream end marker: {} - {}", prefix, content);
+                                // No need to emit this directly
+                            },
+                            _ => {
+                                // Unknown prefix, try to extract useful content
+                                println!("Unknown prefix: {} - content: {}", prefix, content);
+                            }
+                        }
+                    } else if line.starts_with("data: ") {
+                        // Handle standard SSE format as fallback
                         let data = &line[6..]; // Skip "data: " prefix
                         
-                        // Check if it's an empty data or [DONE] marker
                         if data == "[DONE]" {
                             println!("Stream complete marker received");
                             continue;
                         }
                         
-                        // Try to parse as JSON
-                        match serde_json::from_str::<serde_json::Value>(data) {
-                            Ok(json_value) => {
-                                if let Some(text) = json_value.get("text").and_then(|t| t.as_str()) {
-                                    // Valid text chunk found, emit it
-                                    println!("Emitting chunk: {}", text);
-                                    window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
-                                    has_emitted = true;
-                                } else if let Some(finish_reason) = json_value.get("finishReason") {
-                                    // End of stream with finish reason
-                                    println!("Stream finished with reason: {:?}", finish_reason);
-                                } else {
-                                    // Unknown format but valid JSON
-                                    println!("Unknown JSON format: {}", json_value);
-                                }
-                            },
-                            Err(e) => {
-                                // Sometimes data might come in raw text instead of JSON
-                                if !data.is_empty() && !data.starts_with('{') && !data.starts_with('[') {
-                                    // Assume it's plain text if not starting with JSON markers
-                                    println!("Emitting raw text chunk: {}", data);
-                                    window.emit("chat_chunk", data).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
-                                    has_emitted = true;
-                                } else {
-                                    // It's a parsing error for what should be JSON
-                                    println!("Failed to parse data as JSON: {}. Raw data: {}", e, data);
-                                }
+                        // Try to parse data content
+                        if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(data) {
+                            if let Some(text) = json_value.get("text").and_then(|t| t.as_str()) {
+                                println!("Emitting SSE chunk: {}", text);
+                                window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                has_emitted = true;
                             }
+                        } else if !data.is_empty() {
+                            println!("Emitting raw SSE data: {}", data);
+                            window.emit("chat_chunk", data).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                            has_emitted = true;
                         }
                     }
                 }
@@ -323,21 +330,6 @@ async fn chat_mastra<R: Runtime>(
                 window.emit("chat_stream_error", &stream_error_msg).map_err(|e| format!("Failed to emit stream error event: {}", e))?;
                 // Terminate processing on stream error
                 return Err(stream_error_msg);
-            }
-        }
-    }
-
-    // Try one more time with any remaining buffer content
-    if !has_emitted && !buffer.is_empty() {
-        match serde_json::from_str::<serde_json::Value>(&buffer) {
-            Ok(json_value) => {
-                if let Some(text) = json_value.get("text").and_then(|t| t.as_str()) {
-                    println!("Emitting final buffer content: {}", text);
-                    window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
-                }
-            },
-            Err(e) => {
-                println!("Could not parse remaining buffer as JSON: {}", e);
             }
         }
     }
