@@ -28,7 +28,7 @@ interface UploadResult {
 
 export default function PopupWindow() {
   // Initialize useChat - only for state management (messages, input, setInput, setMessages)
-  const { messages, input, setInput, setMessages } = useChat({
+  const { messages, input, setInput, setMessages, append } = useChat({
     // Keep this minimal as we manage streaming via Tauri events
   });
 
@@ -38,9 +38,8 @@ export default function PopupWindow() {
   const [isProcessing, setIsProcessing] = useState(false); // Local loading state
   const [capturing, setCapturing] = useState(false); // State for screenshot capture
   const [fetchError, setFetchError] = useState<string | null>(null); // Local error state
-  const [assistantMessageId, setAssistantMessageId] = useState<string | null>(
-    null
-  ); // Track current assistant message ID
+  // Replace assistantMessageId state with a ref to avoid closure issues
+  const assistantIdRef = useRef<string | null>(null);
   const [screenshotPreview, setScreenshotPreview] = useState<string | null>(
     null
   ); // For preview (base64)
@@ -58,6 +57,60 @@ export default function PopupWindow() {
     type: "success" | "error";
   } | null>(null);
 
+  // Auto-capture screenshot when popup opens
+  useEffect(() => {
+    // fire-and-forget; internal state flags prevent double execution
+    handleCaptureScreenshot(true); // Pass true to indicate background capture
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // ← run exactly once when popup loads
+
+  // Consolidate listeners (mount-only)
+  useEffect(() => {
+    const setupListeners = async () => {
+      const offChunk = await listen<string>("chat_chunk", (event) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantIdRef.current
+              ? { ...m, content: m.content + event.payload }
+              : m
+          )
+        );
+      });
+
+      const offEnd = await listen<void>("chat_stream_end", () => {
+        console.log("Stream ended");
+        setIsProcessing(false);
+        assistantIdRef.current = null; // Reset tracker
+        if (promptInputRef.current) {
+          promptInputRef.current.focus();
+        }
+      });
+
+      const offError = await listen<string>("chat_stream_error", (event) => {
+        console.error("Stream error:", event.payload);
+        setFetchError(event.payload);
+        // Update the placeholder message with the error
+        setMessages((currentMessages) =>
+          currentMessages.map((msg) =>
+            msg.id === assistantIdRef.current
+              ? { ...msg, content: `Error: ${event.payload}` }
+              : msg
+          )
+        );
+        setIsProcessing(false);
+        assistantIdRef.current = null; // Reset tracker
+      });
+
+      return () => {
+        offChunk();
+        offEnd();
+        offError();
+      };
+    };
+
+    setupListeners();
+  }, []); // ← empty deps for mount-only effect
+
   // Show toast notification
   const showToast = (
     message: string,
@@ -65,6 +118,46 @@ export default function PopupWindow() {
   ) => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 3000);
+  };
+
+  // Helper to start greeting chat with just an image URL
+  const startGreetingChat = async (imageUrl: string) => {
+    // 0. defensive guard
+    if (!imageUrl) return;
+    if (isProcessing) return;
+
+    setIsProcessing(true);
+    setFetchError(null);
+
+    try {
+      // 1. make a blank assistant placeholder *first*
+      const assistantId = crypto.randomUUID();
+      assistantIdRef.current = assistantId;
+      append({
+        id: assistantId,
+        role: "assistant",
+        content: "",
+      });
+
+      // 2. call backend (empty prompt, only image)
+      await invoke("chat_mastra", {
+        prompt: "",
+        messagesHistory: [], // fresh conversation
+        imageUrl,
+      });
+    } catch (err: any) {
+      console.error("Error during greeting chat:", err);
+      let errorMessage = "Failed to start greeting chat.";
+      if (typeof err === "string") {
+        errorMessage = err;
+      } else if (err instanceof Error) {
+        errorMessage = err.message;
+      }
+      setFetchError(errorMessage);
+      showToast(errorMessage, "error");
+      setIsProcessing(false);
+      assistantIdRef.current = null;
+    }
   };
 
   // Modify the renderMessageContent function to better handle images within messages
@@ -159,13 +252,13 @@ export default function PopupWindow() {
 
       // Add user message & placeholder assistant message
       const placeholderId = crypto.randomUUID();
+      assistantIdRef.current = placeholderId;
       const placeholderAssistantMessage: Message = {
         id: placeholderId,
         role: "assistant" as const,
         content: "",
       };
       setMessages([...messages, newUserMessage, placeholderAssistantMessage]);
-      setAssistantMessageId(placeholderId);
 
       // Clear input state *now*
       setInput("");
@@ -223,7 +316,7 @@ export default function PopupWindow() {
       showToast(errorMessage, "error");
       setMessages((currentMessages) => currentMessages.slice(0, -2));
       setIsProcessing(false);
-      setAssistantMessageId(null);
+      assistantIdRef.current = null;
     }
     // Note: setIsProcessing(false) is handled by stream end/error events
   };
@@ -278,13 +371,18 @@ export default function PopupWindow() {
   };
 
   // Handler for screenshot capture - NOW includes upload
-  const handleCaptureScreenshot = async () => {
+  const handleCaptureScreenshot = async (isBackgroundCapture = false) => {
     // Prevent capturing if already uploading or processing a message
     if (isUploading || isProcessing) return;
 
     setCapturing(true);
     setIsUploading(true); // Indicate upload process starting
-    setScreenshotPreview(null);
+
+    // Only clear preview if this isn't a background capture
+    if (!isBackgroundCapture) {
+      setScreenshotPreview(null);
+    }
+
     setScreenshotPath(null);
     setLastUploadedR2Key(null); // Clear previous key
     setPresignedUrl(null); // *** Clear previous pre-signed URL ***
@@ -317,81 +415,84 @@ export default function PopupWindow() {
       setScreenshotPath(originalPngPath); // Store path
       console.log("Screenshot captured:", originalPngPath);
 
-      // 3. Generate Preview (same as before)
-      const imgBinary = await readFile(originalPngPath);
-      const resizeImage = (imgBuffer: Uint8Array): Promise<string | null> => {
-        return new Promise((resolve) => {
-          try {
-            const blob = new Blob([imgBuffer], { type: "image/png" });
-            if (blob.size === 0) {
-              console.error("Empty image blob created");
-              resolve(null);
-              return;
-            }
+      // 3. Generate Preview (only if not a background capture)
+      let base64Preview: string | null = null;
+      if (!isBackgroundCapture) {
+        const imgBinary = await readFile(originalPngPath);
+        const resizeImage = (imgBuffer: Uint8Array): Promise<string | null> => {
+          return new Promise((resolve) => {
+            try {
+              const blob = new Blob([imgBuffer], { type: "image/png" });
+              if (blob.size === 0) {
+                console.error("Empty image blob created");
+                resolve(null);
+                return;
+              }
 
-            const url = URL.createObjectURL(blob);
-            const img = new Image();
+              const url = URL.createObjectURL(blob);
+              const img = new Image();
 
-            // Handle image loading errors
-            img.onerror = () => {
-              console.error("Failed to load image");
-              URL.revokeObjectURL(url);
-              resolve(null);
-            };
-
-            img.onload = () => {
-              try {
-                // Create canvas for resizing
-                const canvas = document.createElement("canvas");
-                canvas.width = 512;
-                canvas.height = 512;
-
-                // Draw image with proper scaling
-                const ctx = canvas.getContext("2d");
-                if (!ctx) {
-                  console.error("Failed to get canvas context");
-                  URL.revokeObjectURL(url);
-                  resolve(null);
-                  return;
-                }
-
-                ctx.drawImage(img, 0, 0, 512, 512);
-
-                // Get base64 from canvas
-                const base64 = canvas.toDataURL("image/jpeg", 0.9);
-                URL.revokeObjectURL(url);
-
-                // Validate base64 string
-                if (
-                  !base64 ||
-                  base64 === "data:," ||
-                  !base64.includes("base64")
-                ) {
-                  console.error("Invalid base64 image generated");
-                  resolve(null);
-                  return;
-                }
-
-                resolve(base64);
-              } catch (err) {
-                console.error("Error processing image in canvas:", err);
+              // Handle image loading errors
+              img.onerror = () => {
+                console.error("Failed to load image");
                 URL.revokeObjectURL(url);
                 resolve(null);
-              }
-            };
+              };
 
-            img.src = url;
-          } catch (err) {
-            console.error("Error creating blob from image buffer:", err);
-            resolve(null);
-          }
-        });
-      };
-      const base64Preview = await resizeImage(imgBinary);
-      if (!base64Preview)
-        throw new Error("Failed to process screenshot preview");
-      setScreenshotPreview(base64Preview);
-      console.log("Preview generated.");
+              img.onload = () => {
+                try {
+                  // Create canvas for resizing
+                  const canvas = document.createElement("canvas");
+                  canvas.width = 512;
+                  canvas.height = 512;
+
+                  // Draw image with proper scaling
+                  const ctx = canvas.getContext("2d");
+                  if (!ctx) {
+                    console.error("Failed to get canvas context");
+                    URL.revokeObjectURL(url);
+                    resolve(null);
+                    return;
+                  }
+
+                  ctx.drawImage(img, 0, 0, 512, 512);
+
+                  // Get base64 from canvas
+                  const base64 = canvas.toDataURL("image/jpeg", 0.9);
+                  URL.revokeObjectURL(url);
+
+                  // Validate base64 string
+                  if (
+                    !base64 ||
+                    base64 === "data:," ||
+                    !base64.includes("base64")
+                  ) {
+                    console.error("Invalid base64 image generated");
+                    resolve(null);
+                    return;
+                  }
+
+                  resolve(base64);
+                } catch (err) {
+                  console.error("Error processing image in canvas:", err);
+                  URL.revokeObjectURL(url);
+                  resolve(null);
+                }
+              };
+
+              img.src = url;
+            } catch (err) {
+              console.error("Error creating blob from image buffer:", err);
+              resolve(null);
+            }
+          });
+        };
+        base64Preview = await resizeImage(imgBinary);
+        if (!base64Preview)
+          throw new Error("Failed to process screenshot preview");
+        setScreenshotPreview(base64Preview);
+        console.log("Preview generated.");
+      }
 
       // 4. **Upload Immediately and get key + pre-signed URL**
       console.log(`Uploading ${originalPngPath} immediately...`);
@@ -403,10 +504,17 @@ export default function PopupWindow() {
       setPresignedUrl(uploadResult.url); // *** Store the pre-signed URL ***
       console.log("Uploaded to R2, key:", uploadResult.key);
       console.log("Received pre-signed URL:", uploadResult.url);
-      showToast(`Screenshot captured and uploaded!`); // Update toast message
+
+      // Only show toast for manual captures
+      if (!isBackgroundCapture) {
+        showToast(`Screenshot captured and uploaded!`); // Update toast message
+      }
 
       // 5. Save Local Copy (same as before)
       await saveScreenshotToDesktop();
+
+      // 6. Automatically start greeting chat with the uploaded image
+      await startGreetingChat(uploadResult.url);
 
       // Focus input
       if (promptInputRef.current) {
@@ -414,12 +522,17 @@ export default function PopupWindow() {
       }
     } catch (err) {
       console.error("Error during capture/upload:", err);
-      showToast(
-        `Capture/Upload failed: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-        "error"
-      );
+
+      // Only show toast for manual captures or serious background errors
+      if (!isBackgroundCapture || String(err).includes("permission")) {
+        showToast(
+          `Capture/Upload failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          "error"
+        );
+      }
+
       setFetchError(String(err));
       // Clear potentially inconsistent state on error
       setScreenshotPreview(null);
@@ -463,59 +576,6 @@ export default function PopupWindow() {
     setFetchError(null);
     showToast("Conversation cleared");
   };
-
-  // Effect to set up event listeners
-  useEffect(() => {
-    let unlistenChunk: (() => void) | undefined;
-    let unlistenEnd: (() => void) | undefined;
-    let unlistenError: (() => void) | undefined;
-
-    const setupListeners = async () => {
-      unlistenChunk = await listen<string>("chat_chunk", (event) => {
-        console.log("Chunk received:", event.payload);
-        setMessages((currentMessages) =>
-          currentMessages.map((msg) =>
-            msg.id === assistantMessageId
-              ? { ...msg, content: msg.content + event.payload }
-              : msg
-          )
-        );
-      });
-
-      unlistenEnd = await listen<void>("chat_stream_end", () => {
-        console.log("Stream ended");
-        setIsProcessing(false);
-        setAssistantMessageId(null); // Reset tracker
-        if (promptInputRef.current) {
-          promptInputRef.current.focus();
-        }
-      });
-
-      unlistenError = await listen<string>("chat_stream_error", (event) => {
-        console.error("Stream error:", event.payload);
-        setFetchError(event.payload);
-        // Update the placeholder message with the error
-        setMessages((currentMessages) =>
-          currentMessages.map((msg) =>
-            msg.id === assistantMessageId
-              ? { ...msg, content: `Error: ${event.payload}` }
-              : msg
-          )
-        );
-        setIsProcessing(false);
-        setAssistantMessageId(null); // Reset tracker
-      });
-    };
-
-    setupListeners();
-
-    // Cleanup function
-    return () => {
-      unlistenChunk?.();
-      unlistenEnd?.();
-      unlistenError?.();
-    };
-  }, [assistantMessageId]); // Re-run if assistantMessageId changes (though it shouldn't mid-stream)
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (
@@ -652,7 +712,7 @@ export default function PopupWindow() {
                 >
                   {/* Render content with proper image handling */}
                   {m.role === "assistant" &&
-                  m.id === assistantMessageId &&
+                  m.id === assistantIdRef.current &&
                   isProcessing &&
                   m.content === "" ? (
                     <span className="animate-pulse">▋</span>
@@ -800,7 +860,7 @@ export default function PopupWindow() {
                   size="sm"
                   variant="ghost"
                   disabled={capturing || isUploading || isProcessing} // Disable during capture, upload, or send
-                  onClick={handleCaptureScreenshot}
+                  onClick={() => handleCaptureScreenshot(false)}
                   className="h-8 w-8 rounded-full px-0 bg-black/70 hover:bg-primary transition-colors shrink-0 flex items-center justify-center"
                 >
                   {/* Show different spinner/icon based on state */}
