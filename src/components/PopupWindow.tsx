@@ -60,7 +60,7 @@ export default function PopupWindow() {
   // Auto-capture screenshot when popup opens
   useEffect(() => {
     // fire-and-forget; internal state flags prevent double execution
-    handleCaptureScreenshot(true); // Pass true to indicate background capture
+    handleCaptureScreenshot();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // ← run exactly once when popup loads
 
@@ -371,18 +371,13 @@ export default function PopupWindow() {
   };
 
   // Handler for screenshot capture - NOW includes upload
-  const handleCaptureScreenshot = async (isBackgroundCapture = false) => {
+  const handleCaptureScreenshot = async () => {
     // Prevent capturing if already uploading or processing a message
     if (isUploading || isProcessing) return;
 
     setCapturing(true);
     setIsUploading(true); // Indicate upload process starting
-
-    // Only clear preview if this isn't a background capture
-    if (!isBackgroundCapture) {
-      setScreenshotPreview(null);
-    }
-
+    setScreenshotPreview(null);
     setScreenshotPath(null);
     setLastUploadedR2Key(null); // Clear previous key
     setPresignedUrl(null); // *** Clear previous pre-signed URL ***
@@ -415,84 +410,81 @@ export default function PopupWindow() {
       setScreenshotPath(originalPngPath); // Store path
       console.log("Screenshot captured:", originalPngPath);
 
-      // 3. Generate Preview (only if not a background capture)
-      let base64Preview: string | null = null;
-      if (!isBackgroundCapture) {
-        const imgBinary = await readFile(originalPngPath);
-        const resizeImage = (imgBuffer: Uint8Array): Promise<string | null> => {
-          return new Promise((resolve) => {
-            try {
-              const blob = new Blob([imgBuffer], { type: "image/png" });
-              if (blob.size === 0) {
-                console.error("Empty image blob created");
-                resolve(null);
-                return;
-              }
+      // 3. Generate Preview (same as before)
+      const imgBinary = await readFile(originalPngPath);
+      const resizeImage = (imgBuffer: Uint8Array): Promise<string | null> => {
+        return new Promise((resolve) => {
+          try {
+            const blob = new Blob([imgBuffer], { type: "image/png" });
+            if (blob.size === 0) {
+              console.error("Empty image blob created");
+              resolve(null);
+              return;
+            }
 
-              const url = URL.createObjectURL(blob);
-              const img = new Image();
+            const url = URL.createObjectURL(blob);
+            const img = new Image();
 
-              // Handle image loading errors
-              img.onerror = () => {
-                console.error("Failed to load image");
-                URL.revokeObjectURL(url);
-                resolve(null);
-              };
+            // Handle image loading errors
+            img.onerror = () => {
+              console.error("Failed to load image");
+              URL.revokeObjectURL(url);
+              resolve(null);
+            };
 
-              img.onload = () => {
-                try {
-                  // Create canvas for resizing
-                  const canvas = document.createElement("canvas");
-                  canvas.width = 512;
-                  canvas.height = 512;
+            img.onload = () => {
+              try {
+                // Create canvas for resizing
+                const canvas = document.createElement("canvas");
+                canvas.width = 512;
+                canvas.height = 512;
 
-                  // Draw image with proper scaling
-                  const ctx = canvas.getContext("2d");
-                  if (!ctx) {
-                    console.error("Failed to get canvas context");
-                    URL.revokeObjectURL(url);
-                    resolve(null);
-                    return;
-                  }
-
-                  ctx.drawImage(img, 0, 0, 512, 512);
-
-                  // Get base64 from canvas
-                  const base64 = canvas.toDataURL("image/jpeg", 0.9);
-                  URL.revokeObjectURL(url);
-
-                  // Validate base64 string
-                  if (
-                    !base64 ||
-                    base64 === "data:," ||
-                    !base64.includes("base64")
-                  ) {
-                    console.error("Invalid base64 image generated");
-                    resolve(null);
-                    return;
-                  }
-
-                  resolve(base64);
-                } catch (err) {
-                  console.error("Error processing image in canvas:", err);
+                // Draw image with proper scaling
+                const ctx = canvas.getContext("2d");
+                if (!ctx) {
+                  console.error("Failed to get canvas context");
                   URL.revokeObjectURL(url);
                   resolve(null);
+                  return;
                 }
-              };
 
-              img.src = url;
-            } catch (err) {
-              console.error("Error creating blob from image buffer:", err);
-              resolve(null);
-            }
-          });
-        };
-        base64Preview = await resizeImage(imgBinary);
-        if (!base64Preview)
-          throw new Error("Failed to process screenshot preview");
-        setScreenshotPreview(base64Preview);
-        console.log("Preview generated.");
-      }
+                ctx.drawImage(img, 0, 0, 512, 512);
+
+                // Get base64 from canvas
+                const base64 = canvas.toDataURL("image/jpeg", 0.9);
+                URL.revokeObjectURL(url);
+
+                // Validate base64 string
+                if (
+                  !base64 ||
+                  base64 === "data:," ||
+                  !base64.includes("base64")
+                ) {
+                  console.error("Invalid base64 image generated");
+                  resolve(null);
+                  return;
+                }
+
+                resolve(base64);
+              } catch (err) {
+                console.error("Error processing image in canvas:", err);
+                URL.revokeObjectURL(url);
+                resolve(null);
+              }
+            };
+
+            img.src = url;
+          } catch (err) {
+            console.error("Error creating blob from image buffer:", err);
+            resolve(null);
+          }
+        });
+      };
+      const base64Preview = await resizeImage(imgBinary);
+      if (!base64Preview)
+        throw new Error("Failed to process screenshot preview");
+      setScreenshotPreview(base64Preview);
+      console.log("Preview generated.");
 
       // 4. **Upload Immediately and get key + pre-signed URL**
       console.log(`Uploading ${originalPngPath} immediately...`);
@@ -504,11 +496,7 @@ export default function PopupWindow() {
       setPresignedUrl(uploadResult.url); // *** Store the pre-signed URL ***
       console.log("Uploaded to R2, key:", uploadResult.key);
       console.log("Received pre-signed URL:", uploadResult.url);
-
-      // Only show toast for manual captures
-      if (!isBackgroundCapture) {
-        showToast(`Screenshot captured and uploaded!`); // Update toast message
-      }
+      showToast(`Screenshot captured and uploaded!`); // Update toast message
 
       // 5. Save Local Copy (same as before)
       await saveScreenshotToDesktop();
@@ -522,17 +510,12 @@ export default function PopupWindow() {
       }
     } catch (err) {
       console.error("Error during capture/upload:", err);
-
-      // Only show toast for manual captures or serious background errors
-      if (!isBackgroundCapture || String(err).includes("permission")) {
-        showToast(
-          `Capture/Upload failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-          "error"
-        );
-      }
-
+      showToast(
+        `Capture/Upload failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        "error"
+      );
       setFetchError(String(err));
       // Clear potentially inconsistent state on error
       setScreenshotPreview(null);
@@ -860,7 +843,7 @@ export default function PopupWindow() {
                   size="sm"
                   variant="ghost"
                   disabled={capturing || isUploading || isProcessing} // Disable during capture, upload, or send
-                  onClick={() => handleCaptureScreenshot(false)}
+                  onClick={handleCaptureScreenshot}
                   className="h-8 w-8 rounded-full px-0 bg-black/70 hover:bg-primary transition-colors shrink-0 flex items-center justify-center"
                 >
                   {/* Show different spinner/icon based on state */}
