@@ -165,7 +165,12 @@ async fn chat_mastra<R: Runtime>(
     app: AppHandle<R>,
 ) -> std::result::Result<(), String> {
     let mastra_endpoint = "http://localhost:4111/api/agents/weatherAgent/stream";
-    let client = reqwest::Client::new();
+    // Create a client with optimized timeout and pool settings
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))  // Set a reasonable timeout 
+        .pool_max_idle_per_host(10)        // Keep connections alive for reuse
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
     // Start constructing the messages payload for Mastra
     let mut final_messages_payload: Vec<serde_json::Value> = Vec::new();
@@ -219,7 +224,6 @@ async fn chat_mastra<R: Runtime>(
         }
     }
 
-
     // Prepare request body according to Mastra stream API
     let request_body = serde_json::json!({
         "messages": final_messages_payload,
@@ -251,22 +255,26 @@ async fn chat_mastra<R: Runtime>(
 
     // Process the stream - use the stream method available in reqwest with tokio_stream
     let mut stream = res.bytes_stream();
-    let mut buffer = String::new();
+    let mut buffer = String::with_capacity(1024); // Pre-allocate a decent buffer size
+
+    // Create a debouncer to coalesce small updates and reduce UI renders
+    let mut last_emit = std::time::Instant::now();
+    let mut accumulated_text = String::with_capacity(512);  
 
     while let Some(item) = stream.next().await {
         match item {
             Ok(chunk_bytes) => {
                 // Convert the bytes to a string
                 let chunk_str = String::from_utf8_lossy(&chunk_bytes).to_string();
-                println!("Raw chunk: {}", chunk_str); // Debug logging
-
+                
                 // Append to our buffer
                 buffer.push_str(&chunk_str);
 
-                // Process any complete lines - Mastra uses a custom format
-                while let Some(pos) = buffer.find("\n") {
+                // Process any complete lines
+                while let Some(pos) = buffer.find('\n') {
                     let line = buffer[..pos].trim().to_string();
-                    buffer = buffer[pos + 1..].to_string();
+                    // More efficient substring extraction
+                    buffer.drain(..=pos);
 
                     // Skip empty lines
                     if line.is_empty() {
@@ -274,7 +282,6 @@ async fn chat_mastra<R: Runtime>(
                     }
 
                     // Parse the Mastra streaming format with different prefixes
-                    // Format appears to be: prefix:content where prefix is f, 0, e, or d
                     if line.len() >= 2 && line.chars().nth(1) == Some(':') {
                         let prefix = line.chars().next().unwrap_or('?');
                         let content = &line[2..];
@@ -283,30 +290,48 @@ async fn chat_mastra<R: Runtime>(
                             'f' => {
                                 // First message, typically contains messageId
                                 println!("Message start: {}", content);
-                                // No need to emit this part
                             },
                             '0' => {
-                                // Text content chunk
-                                // Parse the string content - it should be JSON encoded
+                                // Text content chunk - use efficient string handling
                                 if let Ok(content_json) = serde_json::from_str::<serde_json::Value>(content) {
                                     if let Some(text) = content_json.as_str() {
-                                        println!("Emitting text chunk: {}", text);
-                                        window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                        // Accumulate text and only emit after a reasonable batch or time
+                                        accumulated_text.push_str(text);
+                                        
+                                        // Emit if we have enough text or enough time has passed
+                                        let now = std::time::Instant::now();
+                                        if accumulated_text.len() > 50 || now.duration_since(last_emit).as_millis() > 100 {
+                                            window.emit("chat_chunk", &accumulated_text)
+                                                .map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                            accumulated_text.clear();
+                                            last_emit = now;
+                                        }
                                     }
-                                } else {
-                                    // If not valid JSON, just emit the raw content without the quotes
-                                    // This is a fallback but shouldn't normally be needed
-                                    if content.starts_with('"') && content.ends_with('"') && content.len() >= 2 {
-                                        let clean_content = &content[1..content.len()-1];
-                                        println!("Emitting cleaned text chunk: {}", clean_content);
-                                        window.emit("chat_chunk", clean_content).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                } else if content.starts_with('"') && content.ends_with('"') && content.len() >= 2 {
+                                    // Handle quoted content
+                                    let clean_content = &content[1..content.len()-1];
+                                    accumulated_text.push_str(clean_content);
+                                    
+                                    // Same emit logic as above
+                                    let now = std::time::Instant::now();
+                                    if accumulated_text.len() > 50 || now.duration_since(last_emit).as_millis() > 100 {
+                                        window.emit("chat_chunk", &accumulated_text)
+                                            .map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                        accumulated_text.clear();
+                                        last_emit = now;
                                     }
                                 }
                             },
                             'e' | 'd' => {
                                 // End message or Done message
                                 println!("Stream end marker: {} - {}", prefix, content);
-                                // No need to emit this directly
+                                
+                                // Emit any remaining accumulated text
+                                if !accumulated_text.is_empty() {
+                                    window.emit("chat_chunk", &accumulated_text)
+                                        .map_err(|e| format!("Failed to emit final chat chunk: {}", e))?;
+                                    accumulated_text.clear();
+                                }
                             },
                             '3' => {
                                 // Error message
@@ -317,7 +342,8 @@ async fn chat_mastra<R: Runtime>(
                                 } else {
                                     content
                                 };
-                                window.emit("chat_stream_error", error_content).map_err(|e| format!("Failed to emit error: {}", e))?;
+                                window.emit("chat_stream_error", error_content)
+                                    .map_err(|e| format!("Failed to emit error: {}", e))?;
                             },
                             _ => {
                                 // Unknown prefix, try to extract useful content
@@ -330,18 +356,40 @@ async fn chat_mastra<R: Runtime>(
 
                         if data == "[DONE]" {
                             println!("Stream complete marker received");
+                            // Emit any remaining text
+                            if !accumulated_text.is_empty() {
+                                window.emit("chat_chunk", &accumulated_text)
+                                    .map_err(|e| format!("Failed to emit final SSE chat chunk: {}", e))?;
+                                accumulated_text.clear();
+                            }
                             continue;
                         }
 
                         // Try to parse data content
                         if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(data) {
                             if let Some(text) = json_value.get("text").and_then(|t| t.as_str()) {
-                                println!("Emitting SSE chunk: {}", text);
-                                window.emit("chat_chunk", text).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                accumulated_text.push_str(text);
+                                
+                                // Same emit logic
+                                let now = std::time::Instant::now();
+                                if accumulated_text.len() > 50 || now.duration_since(last_emit).as_millis() > 100 {
+                                    window.emit("chat_chunk", &accumulated_text)
+                                        .map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                                    accumulated_text.clear();
+                                    last_emit = now;
+                                }
                             }
                         } else if !data.is_empty() {
-                            println!("Emitting raw SSE data: {}", data);
-                            window.emit("chat_chunk", data).map_err(|e| format!("Failed to emit chat chunk: {}", e))?;
+                            accumulated_text.push_str(data);
+                            
+                            // Same emit logic
+                            let now = std::time::Instant::now();
+                            if accumulated_text.len() > 50 || now.duration_since(last_emit).as_millis() > 100 {
+                                window.emit("chat_chunk", &accumulated_text)
+                                    .map_err(|e| format!("Failed to emit raw SSE chunk: {}", e))?;
+                                accumulated_text.clear();
+                                last_emit = now;
+                            }
                         }
                     }
                 }
@@ -350,11 +398,18 @@ async fn chat_mastra<R: Runtime>(
                 // Error reading from the stream
                 let stream_error_msg = format!("Error reading stream from Mastra: {}", e);
                 eprintln!("{}", stream_error_msg);
-                window.emit("chat_stream_error", &stream_error_msg).map_err(|e| format!("Failed to emit stream error event: {}", e))?;
+                window.emit("chat_stream_error", &stream_error_msg)
+                    .map_err(|e| format!("Failed to emit stream error event: {}", e))?;
                 // Terminate processing on stream error
                 return Err(stream_error_msg);
             }
         }
+    }
+
+    // Emit any remaining text before signaling the end
+    if !accumulated_text.is_empty() {
+        window.emit("chat_chunk", &accumulated_text)
+            .map_err(|e| format!("Failed to emit final chat chunk: {}", e))?;
     }
 
     // Signal the end of the stream
@@ -391,11 +446,14 @@ async fn upload_image_to_r2(file_path: String) -> tauri::Result<UploadResult> {
     let endpoint_url = format!("https://{}.r2.cloudflarestorage.com", account_id);
     println!("Using R2 endpoint: {}", endpoint_url);
 
-    // Configure AWS SDK
+    // Configure AWS SDK with optimized retry settings
     let region_provider = RegionProviderChain::first_try(Region::new("auto")); // R2 specific region
     let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(region_provider)
         .endpoint_url(endpoint_url.clone()) // Clone endpoint_url for use here
+        .retry_config(aws_config::retry::RetryConfig::standard()
+            .with_max_attempts(3) // Limit retry attempts to reduce latency on failure
+            .with_initial_backoff(Duration::from_millis(100))) // Start retries quickly
         .credentials_provider(aws_sdk_s3::config::Credentials::new(
             &access_key_id,
             &secret_access_key,
@@ -420,7 +478,6 @@ async fn upload_image_to_r2(file_path: String) -> tauri::Result<UploadResult> {
     let key = format!("{}-{}.{}", file_stem, Uuid::new_v4(), extension);
     println!("Generated R2 key: {}", key);
 
-
     // Create ByteStream from the file path, map error to anyhow::Error
     let body = ByteStream::from_path(Path::new(&file_path))
         .await
@@ -431,7 +488,14 @@ async fn upload_image_to_r2(file_path: String) -> tauri::Result<UploadResult> {
     let put_object_output = client.put_object()
         .bucket(&bucket_name)
         .key(&key)
-        // Consider adding content type if known, e.g., .content_type("image/png")
+        // Add appropriate content type if possible based on extension
+        .content_type(match extension.to_lowercase().as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            _ => "application/octet-stream",
+        })
         .body(body)
         .send()
         .await
@@ -444,9 +508,12 @@ async fn upload_image_to_r2(file_path: String) -> tauri::Result<UploadResult> {
 
     println!("Successfully uploaded {} to R2 bucket {}", key, bucket_name);
 
-    // Generate pre-signed URL after successful upload
-    let presigning_config = PresigningConfig::expires_in(Duration::from_secs(3600)) // e.g., 1 hour validity
-        .context("Failed to create presigning config")?; // Use anyhow::Context for better error
+    // Generate pre-signed URL with optimized configuration
+    // Use shorter expiration for better security and to avoid browser caching issues
+    let presigning_config = PresigningConfig::builder()
+        .expires_in(Duration::from_secs(1800)) // 30 minutes - balanced for security vs usability
+        .build()
+        .context("Failed to create presigning config")?;
 
     println!("Generating pre-signed URL for key: {}", key);
     let presigned_request = client.get_object()
@@ -454,7 +521,7 @@ async fn upload_image_to_r2(file_path: String) -> tauri::Result<UploadResult> {
         .key(&key)
         .presigned(presigning_config)
         .await
-        .context("Failed to generate pre-signed URL")?; // Use anyhow::Context
+        .context("Failed to generate pre-signed URL")?;
 
     let presigned_url = presigned_request.uri().to_string();
     println!("Generated pre-signed URL: {}", presigned_url);

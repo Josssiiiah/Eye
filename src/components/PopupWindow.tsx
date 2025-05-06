@@ -75,19 +75,19 @@ export default function PopupWindow() {
 
   // Consolidate listeners (mount-only)
   useEffect(() => {
-    let isMounted = true;                             // helps guard against async race
+    let isMounted = true; // helps guard against async race
 
     (async () => {
       /* ----------- guard against Strict-Mode double run ----------- */
-      if (tauriListenersRef.current) return;          // already registered
+      if (tauriListenersRef.current) return; // already registered
 
       const offChunk = await listen<string>("chat_chunk", ({ payload }) => {
-        setMessages(prev =>
-          prev.map(m =>
+        setMessages((prev) =>
+          prev.map((m) =>
             m.id === assistantIdRef.current
               ? { ...m, content: m.content + payload }
-              : m,
-          ),
+              : m
+          )
         );
       });
 
@@ -99,15 +99,15 @@ export default function PopupWindow() {
         }
       });
 
-      const offErr = await listen<string>("chat_stream_error", e => {
+      const offErr = await listen<string>("chat_stream_error", (e) => {
         setFetchError(e.payload);
         // Update the placeholder message with the error
-        setMessages(prev =>
-          prev.map(m =>
+        setMessages((prev) =>
+          prev.map((m) =>
             m.id === assistantIdRef.current
               ? { ...m, content: `Error: ${e.payload}` }
-              : m,
-          ),
+              : m
+          )
         );
         setIsProcessing(false);
         assistantIdRef.current = null;
@@ -117,7 +117,9 @@ export default function PopupWindow() {
         tauriListenersRef.current = { offChunk, offEnd, offErr };
       } else {
         /* component unmounted before async finished */
-        offChunk(); offEnd(); offErr();
+        offChunk();
+        offEnd();
+        offErr();
       }
     })();
 
@@ -127,10 +129,10 @@ export default function PopupWindow() {
         tauriListenersRef.current.offChunk?.();
         tauriListenersRef.current.offEnd?.();
         tauriListenersRef.current.offErr?.();
-        tauriListenersRef.current = null;             // clear for next mount
+        tauriListenersRef.current = null; // clear for next mount
       }
     };
-  }, []);                                             // ← stays empty
+  }, []); // ← stays empty
 
   // Show toast notification
   const showToast = (
@@ -353,7 +355,7 @@ export default function PopupWindow() {
       // Use original file extension if possible, default to png
       const fileExtension = screenshotPath.split(".").pop() || "png";
       const fileName = `zen-screenshot-${timestamp}.${fileExtension}`;
-      const destinationPath = `${desktopPath}${fileName}`;
+      const destinationPath = `${desktopPath}/${fileName}`;
 
       // Read the original file
       const bytes = await readFile(screenshotPath); // Read original path
@@ -442,58 +444,54 @@ export default function PopupWindow() {
               return;
             }
 
-            const url = URL.createObjectURL(blob);
-            const img = new Image();
+            // Use createImageBitmap for better performance compared to direct Image loading
+            createImageBitmap(blob)
+              .then((imageBitmap) => {
+                try {
+                  // Create canvas for resizing
+                  const canvas = document.createElement("canvas");
+                  canvas.width = 512;
+                  canvas.height = 512;
 
-            // Handle image loading errors
-            img.onerror = () => {
-              console.error("Failed to load image");
-              URL.revokeObjectURL(url);
-              resolve(null);
-            };
+                  // Draw image with proper scaling
+                  const ctx = canvas.getContext("2d", { alpha: false }); // Disable alpha for performance
+                  if (!ctx) {
+                    console.error("Failed to get canvas context");
+                    resolve(null);
+                    return;
+                  }
 
-            img.onload = () => {
-              try {
-                // Create canvas for resizing
-                const canvas = document.createElement("canvas");
-                canvas.width = 512;
-                canvas.height = 512;
+                  // Use integer coordinates to avoid sub-pixel rendering
+                  ctx.imageSmoothingQuality = "medium"; // Balance quality and performance
+                  ctx.drawImage(imageBitmap, 0, 0, 512, 512);
 
-                // Draw image with proper scaling
-                const ctx = canvas.getContext("2d");
-                if (!ctx) {
-                  console.error("Failed to get canvas context");
-                  URL.revokeObjectURL(url);
+                  // Get base64 from canvas - use JPEG for smaller size
+                  const base64 = canvas.toDataURL("image/jpeg", 0.85);
+
+                  // Clean up bitmap to free memory
+                  imageBitmap.close();
+
+                  // Validate base64 string
+                  if (
+                    !base64 ||
+                    base64 === "data:," ||
+                    !base64.includes("base64")
+                  ) {
+                    console.error("Invalid base64 image generated");
+                    resolve(null);
+                    return;
+                  }
+
+                  resolve(base64);
+                } catch (err) {
+                  console.error("Error processing image in canvas:", err);
                   resolve(null);
-                  return;
                 }
-
-                ctx.drawImage(img, 0, 0, 512, 512);
-
-                // Get base64 from canvas
-                const base64 = canvas.toDataURL("image/jpeg", 0.9);
-                URL.revokeObjectURL(url);
-
-                // Validate base64 string
-                if (
-                  !base64 ||
-                  base64 === "data:," ||
-                  !base64.includes("base64")
-                ) {
-                  console.error("Invalid base64 image generated");
-                  resolve(null);
-                  return;
-                }
-
-                resolve(base64);
-              } catch (err) {
-                console.error("Error processing image in canvas:", err);
-                URL.revokeObjectURL(url);
+              })
+              .catch((err) => {
+                console.error("Error creating image bitmap:", err);
                 resolve(null);
-              }
-            };
-
-            img.src = url;
+              });
           } catch (err) {
             console.error("Error creating blob from image buffer:", err);
             resolve(null);
@@ -774,55 +772,57 @@ export default function PopupWindow() {
             </div>
 
             {/* Screenshot Preview */}
-            {screenshotPreview && !greetingSentRef.current && !isProcessing && (
-              <motion.div
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="mt-4 rounded-xl overflow-hidden relative group"
-              >
-                <div className="w-full relative pb-2">
-                  <img
-                    src={screenshotPreview}
-                    alt="Screenshot preview"
-                    className="max-w-full h-auto max-h-[300px] object-contain rounded-xl border border-border/30 mx-auto"
-                  />
-                  <div className="absolute top-2 right-2 opacity-80 group-hover:opacity-100 transition-opacity flex gap-2">
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      className="h-7 rounded-full bg-black/70 hover:bg-primary transition-colors"
-                      onClick={() => {
-                        setScreenshotPreview(null);
-                        setScreenshotPath(null);
-                        setLastUploadedR2Key(null); // *** Clear R2 key on manual removal ***
-                        setPresignedUrl(null); // *** Clear pre-signed URL on manual removal ***
-                      }}
-                    >
-                      <X className="h-3 w-3 mr-1" />
-                      <span className="text-xs">Remove</span>
-                    </Button>
-                    {lastScreenshotPath && (
+            {screenshotPreview &&
+              (!greetingSentRef.current || lastUploadedR2Key) &&
+              !isProcessing && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="mt-4 rounded-xl overflow-hidden relative group"
+                >
+                  <div className="w-full relative pb-2">
+                    <img
+                      src={screenshotPreview}
+                      alt="Screenshot preview"
+                      className="max-w-full h-auto max-h-[300px] object-contain rounded-xl border border-border/30 mx-auto"
+                    />
+                    <div className="absolute top-2 right-2 opacity-80 group-hover:opacity-100 transition-opacity flex gap-2">
                       <Button
                         size="sm"
                         variant="secondary"
                         className="h-7 rounded-full bg-black/70 hover:bg-primary transition-colors"
-                        onClick={openSavedScreenshot}
+                        onClick={() => {
+                          setScreenshotPreview(null);
+                          setScreenshotPath(null);
+                          setLastUploadedR2Key(null); // *** Clear R2 key on manual removal ***
+                          setPresignedUrl(null); // *** Clear pre-signed URL on manual removal ***
+                        }}
                       >
-                        <Download className="h-3 w-3 mr-1" />
-                        <span className="text-xs">Open</span>
+                        <X className="h-3 w-3 mr-1" />
+                        <span className="text-xs">Remove</span>
                       </Button>
-                    )}
+                      {lastScreenshotPath && (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          className="h-7 rounded-full bg-black/70 hover:bg-primary transition-colors"
+                          onClick={openSavedScreenshot}
+                        >
+                          <Download className="h-3 w-3 mr-1" />
+                          <span className="text-xs">Open</span>
+                        </Button>
+                      )}
+                    </div>
+                    <p className="text-xs text-center mt-1 text-muted-foreground">
+                      {/* Update text based on whether key exists */}
+                      {lastUploadedR2Key
+                        ? "Screenshot uploaded."
+                        : "Screenshot captured."}
+                      {lastScreenshotPath ? " Saved locally." : ""}
+                    </p>
                   </div>
-                  <p className="text-xs text-center mt-1 text-muted-foreground">
-                    {/* Update text based on whether key exists */}
-                    {lastUploadedR2Key
-                      ? "Screenshot uploaded."
-                      : "Screenshot captured."}
-                    {lastScreenshotPath ? " Saved locally." : ""}
-                  </p>
-                </div>
-              </motion.div>
-            )}
+                </motion.div>
+              )}
 
             {/* Toast Notification */}
             <AnimatePresence>

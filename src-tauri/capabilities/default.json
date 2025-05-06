@@ -20,13 +20,16 @@
     "macos-permissions:default",
     "fs:default",
     "fs:allow-read-file",
+    "fs:allow-write-file",
     {
       "identifier": "fs:scope",
       "allow": [
         { "path": "$APPDATA" },
         { "path": "$APPDATA/**" },
         { "path": "$APPSUPPORT" },
-        { "path": "$APPSUPPORT/**" }
+        { "path": "$APPSUPPORT/**" },
+        { "path": "$DESKTOP" },
+        { "path": "$DESKTOP/**" }
       ]
     }
   ]
