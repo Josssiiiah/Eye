@@ -25,7 +25,15 @@
         {
           "identifier": "default",
           "windows": ["main", "popup", "drag-chat"],
-          "permissions": ["core:event:default"]
+          "permissions": [
+            "core:event:default",
+            "macos-permissions:default",
+            "screenshots:allow-get-screenshotable-monitors",
+            "screenshots:allow-get-screenshotable-windows", 
+            "screenshots:default",
+            "fs:read-files",
+            "fs:write-files"
+          ]
         }
       ]
     },
