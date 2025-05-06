@@ -22,6 +22,7 @@
     "security": {
       "csp": null,
       "capabilities": [
+        "main-capability",
         {
           "identifier": "default",
           "windows": ["main", "popup", "drag-chat"],
@@ -29,7 +30,7 @@
             "core:event:default",
             "macos-permissions:default",
             "screenshots:allow-get-screenshotable-monitors",
-            "screenshots:allow-get-screenshotable-windows", 
+            "screenshots:allow-get-screenshotable-windows",
             "screenshots:default",
             "fs:read-files",
             "fs:write-files"

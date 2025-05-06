@@ -658,7 +658,9 @@ export default function PopupWindow() {
               style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
             >
               {/* Top bar without buttons */}
-              <div style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}></div>
+              <div
+                style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
+              ></div>
             </div>
           </div>
 
@@ -877,7 +879,9 @@ export default function PopupWindow() {
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={() => invoke("close_popup_window").catch(console.error)}
+                  onClick={() =>
+                    invoke("close_popup_window").catch(console.error)
+                  }
                   title="Close window"
                   className="h-8 w-8 rounded-full px-0 bg-black/70 hover:bg-primary transition-colors shrink-0 flex items-center justify-center"
                 >

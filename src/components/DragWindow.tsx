@@ -461,7 +461,7 @@ export default function DragWindow() {
   }, [messages, screenshotPreview]);
 
   return (
-    <div className="fixed inset-0 bg-background/65 rounded-xl backdrop-blur-sm flex h-full drag-shadow">
+    <div className="fixed inset-0 bg-background/15 rounded-xl backdrop-blur-sm flex h-full drag-shadow">
       {/* Outer container for scrolling */}
       <div
         ref={scrollAreaRef}
