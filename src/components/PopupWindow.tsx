@@ -32,6 +32,15 @@ export default function PopupWindow() {
     // Keep this minimal as we manage streaming via Tauri events
   });
 
+  // Gate refs to prevent duplicate operations
+  const didAutoInitRef = useRef(false); // gate to run once per window
+  const greetingSentRef = useRef(false); // gate to call chat once
+  const tauriListenersRef = useRef<{
+    offChunk?: () => void;
+    offEnd?: () => void;
+    offErr?: () => void;
+  } | null>(null);
+
   const [isInputFocused, setIsInputFocused] = useState(false);
   const promptInputRef = useRef<HTMLInputElement>(null);
   const scrollAreaRef = useRef<HTMLDivElement>(null); // Ref for scrolling
@@ -59,57 +68,69 @@ export default function PopupWindow() {
 
   // Auto-capture screenshot when popup opens
   useEffect(() => {
-    // fire-and-forget; internal state flags prevent double execution
-    handleCaptureScreenshot();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // ← run exactly once when popup loads
+    if (didAutoInitRef.current) return; // already ran
+    didAutoInitRef.current = true;
+    captureAndGreet(); // new helper below
+  }, []);
 
   // Consolidate listeners (mount-only)
   useEffect(() => {
-    const setupListeners = async () => {
-      const offChunk = await listen<string>("chat_chunk", (event) => {
-        setMessages((prev) =>
-          prev.map((m) =>
+    let isMounted = true;                             // helps guard against async race
+
+    (async () => {
+      /* ----------- guard against Strict-Mode double run ----------- */
+      if (tauriListenersRef.current) return;          // already registered
+
+      const offChunk = await listen<string>("chat_chunk", ({ payload }) => {
+        setMessages(prev =>
+          prev.map(m =>
             m.id === assistantIdRef.current
-              ? { ...m, content: m.content + event.payload }
-              : m
-          )
+              ? { ...m, content: m.content + payload }
+              : m,
+          ),
         );
       });
 
-      const offEnd = await listen<void>("chat_stream_end", () => {
-        console.log("Stream ended");
+      const offEnd = await listen("chat_stream_end", () => {
+        assistantIdRef.current = null;
         setIsProcessing(false);
-        assistantIdRef.current = null; // Reset tracker
         if (promptInputRef.current) {
           promptInputRef.current.focus();
         }
       });
 
-      const offError = await listen<string>("chat_stream_error", (event) => {
-        console.error("Stream error:", event.payload);
-        setFetchError(event.payload);
+      const offErr = await listen<string>("chat_stream_error", e => {
+        setFetchError(e.payload);
         // Update the placeholder message with the error
-        setMessages((currentMessages) =>
-          currentMessages.map((msg) =>
-            msg.id === assistantIdRef.current
-              ? { ...msg, content: `Error: ${event.payload}` }
-              : msg
-          )
+        setMessages(prev =>
+          prev.map(m =>
+            m.id === assistantIdRef.current
+              ? { ...m, content: `Error: ${e.payload}` }
+              : m,
+          ),
         );
         setIsProcessing(false);
-        assistantIdRef.current = null; // Reset tracker
+        assistantIdRef.current = null;
       });
 
-      return () => {
-        offChunk();
-        offEnd();
-        offError();
-      };
-    };
+      if (isMounted) {
+        tauriListenersRef.current = { offChunk, offEnd, offErr };
+      } else {
+        /* component unmounted before async finished */
+        offChunk(); offEnd(); offErr();
+      }
+    })();
 
-    setupListeners();
-  }, []); // ← empty deps for mount-only effect
+    return () => {
+      isMounted = false;
+      if (tauriListenersRef.current) {
+        tauriListenersRef.current.offChunk?.();
+        tauriListenersRef.current.offEnd?.();
+        tauriListenersRef.current.offErr?.();
+        tauriListenersRef.current = null;             // clear for next mount
+      }
+    };
+  }, []);                                             // ← stays empty
 
   // Show toast notification
   const showToast = (
@@ -122,29 +143,26 @@ export default function PopupWindow() {
 
   // Helper to start greeting chat with just an image URL
   const startGreetingChat = async (imageUrl: string) => {
-    // 0. defensive guard
+    if (greetingSentRef.current) return; // guard duplicates
     if (!imageUrl) return;
-    if (isProcessing) return;
 
     setIsProcessing(true);
     setFetchError(null);
 
     try {
-      // 1. make a blank assistant placeholder *first*
-      const assistantId = crypto.randomUUID();
-      assistantIdRef.current = assistantId;
-      append({
-        id: assistantId,
-        role: "assistant",
-        content: "",
-      });
+      // 1. Create a placeholder first
+      const id = crypto.randomUUID();
+      assistantIdRef.current = id;
+      append({ id, role: "assistant", content: "" }); // useChat append
 
-      // 2. call backend (empty prompt, only image)
+      // 2. Call backend (empty prompt, only image)
       await invoke("chat_mastra", {
         prompt: "",
         messagesHistory: [], // fresh conversation
         imageUrl,
       });
+
+      greetingSentRef.current = true; // lock
     } catch (err: any) {
       console.error("Error during greeting chat:", err);
       let errorMessage = "Failed to start greeting chat.";
@@ -371,13 +389,15 @@ export default function PopupWindow() {
   };
 
   // Handler for screenshot capture - NOW includes upload
-  const handleCaptureScreenshot = async () => {
+  const captureScreenshot = async (showPreview = true) => {
     // Prevent capturing if already uploading or processing a message
     if (isUploading || isProcessing) return;
 
     setCapturing(true);
     setIsUploading(true); // Indicate upload process starting
-    setScreenshotPreview(null);
+    if (showPreview) {
+      setScreenshotPreview(null);
+    }
     setScreenshotPath(null);
     setLastUploadedR2Key(null); // Clear previous key
     setPresignedUrl(null); // *** Clear previous pre-signed URL ***
@@ -483,8 +503,11 @@ export default function PopupWindow() {
       const base64Preview = await resizeImage(imgBinary);
       if (!base64Preview)
         throw new Error("Failed to process screenshot preview");
-      setScreenshotPreview(base64Preview);
-      console.log("Preview generated.");
+
+      if (showPreview) {
+        setScreenshotPreview(base64Preview);
+        console.log("Preview generated.");
+      }
 
       // 4. **Upload Immediately and get key + pre-signed URL**
       console.log(`Uploading ${originalPngPath} immediately...`);
@@ -496,18 +519,20 @@ export default function PopupWindow() {
       setPresignedUrl(uploadResult.url); // *** Store the pre-signed URL ***
       console.log("Uploaded to R2, key:", uploadResult.key);
       console.log("Received pre-signed URL:", uploadResult.url);
-      showToast(`Screenshot captured and uploaded!`); // Update toast message
+
+      if (showPreview) {
+        showToast(`Screenshot captured and uploaded!`); // Update toast message
+      }
 
       // 5. Save Local Copy (same as before)
       await saveScreenshotToDesktop();
-
-      // 6. Automatically start greeting chat with the uploaded image
-      await startGreetingChat(uploadResult.url);
 
       // Focus input
       if (promptInputRef.current) {
         promptInputRef.current.focus();
       }
+
+      return uploadResult; // Return the upload result
     } catch (err) {
       console.error("Error during capture/upload:", err);
       showToast(
@@ -518,7 +543,9 @@ export default function PopupWindow() {
       );
       setFetchError(String(err));
       // Clear potentially inconsistent state on error
-      setScreenshotPreview(null);
+      if (showPreview) {
+        setScreenshotPreview(null);
+      }
       setScreenshotPath(null);
       setLastUploadedR2Key(null);
       setPresignedUrl(null); // *** Clear pre-signed URL on error ***
@@ -530,10 +557,23 @@ export default function PopupWindow() {
           originalPngPath
         );
       }
+      return null;
     } finally {
       setCapturing(false);
       setIsUploading(false); // Ensure upload state is reset
     }
+  };
+
+  // Helper to silently capture screenshot and start greeting
+  const captureAndGreet = async () => {
+    const upload = await captureScreenshot(false); // silent capture
+    if (!upload?.url) {
+      console.error("Failed to capture and upload screenshot for greeting");
+      return;
+    }
+
+    // Start greeting with the uploaded image
+    await startGreetingChat(upload.url);
   };
 
   // Open the saved screenshot
@@ -734,7 +774,7 @@ export default function PopupWindow() {
             </div>
 
             {/* Screenshot Preview */}
-            {screenshotPreview && !isProcessing && (
+            {screenshotPreview && !greetingSentRef.current && !isProcessing && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
@@ -843,7 +883,7 @@ export default function PopupWindow() {
                   size="sm"
                   variant="ghost"
                   disabled={capturing || isUploading || isProcessing} // Disable during capture, upload, or send
-                  onClick={handleCaptureScreenshot}
+                  onClick={() => captureScreenshot()}
                   className="h-8 w-8 rounded-full px-0 bg-black/70 hover:bg-primary transition-colors shrink-0 flex items-center justify-center"
                 >
                   {/* Show different spinner/icon based on state */}
