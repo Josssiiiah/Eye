@@ -8,14 +8,13 @@ function App() {
   };
 
   return (
-    <main className="container mx-auto px-4 py-12 max-w-3xl">
-      <h1 className="text-2xl font-bold mb-4">Welcome to Tauri + React</h1>
-      <p className="text-muted-foreground mb-6">
-        Click the button below to open a transparent, rounded popup window.
-      </p>
-
-      <Button onClick={openPopup} className="bg-primary hover:bg-primary/90">
-        Open Transparent Popup
+    <main className="fixed top-0 left-0 right-0 bg-black/20 backdrop-blur-sm h-12 flex items-center justify-end px-4">
+      <Button
+        onClick={openPopup}
+        variant="ghost"
+        className="text-white hover:bg-white/20"
+      >
+        Ask AI
       </Button>
     </main>
   );

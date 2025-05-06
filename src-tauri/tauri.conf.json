@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "zen",
-        "width": 800,
-        "height": 600,
+        "width": 750,
+        "height": 50,
         "hiddenTitle": true,
         "titleBarStyle": "Transparent"
       }

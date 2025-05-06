@@ -646,10 +646,7 @@ export default function PopupWindow() {
         {/* Inner container to ensure content pushes height */}
         <div className="flex flex-col min-h-full">
           {/* Drag Region & Header */}
-          <div
-            data-tauri-drag-region
-            className="sticky top-0 z-10 bg-background/65 backdrop-blur-sm"
-          >
+          <div data-tauri-drag-region className="sticky top-0 z-10">
             <div
               data-tauri-drag-region
               className="absolute top-0 left-0 right-0 h-8"
@@ -660,39 +657,8 @@ export default function PopupWindow() {
               className="flex items-center justify-between px-6 pt-5 pb-3"
               style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
             >
-              <h1
-                data-tauri-drag-region
-                className="text-lg font-medium tracking-tight"
-                style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
-              >
-                Zen Chat
-              </h1>
-              <div
-                className="flex items-center gap-2"
-                style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
-              >
-                <Button
-                  onClick={clearConversation}
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7 rounded-full transition-colors duration-300"
-                  title="Clear conversation"
-                >
-                  <Trash className="h-4 w-4" />
-                  <span className="sr-only">Clear conversation</span>
-                </Button>
-                <Button
-                  onClick={() =>
-                    invoke("close_popup_window").catch(console.error)
-                  }
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7 rounded-full transition-colors duration-300"
-                >
-                  <X className="h-4 w-4" />
-                  <span className="sr-only">Close</span>
-                </Button>
-              </div>
+              {/* Top bar without buttons */}
+              <div style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}></div>
             </div>
           </div>
 
@@ -895,6 +861,28 @@ export default function PopupWindow() {
                     <Camera className="h-4 w-4" />
                   )}
                   <span className="sr-only">Take Screenshot</span>
+                </Button>
+                {/* Trash Button - Moved from top */}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={clearConversation}
+                  title="Clear conversation"
+                  className="h-8 w-8 rounded-full px-0 bg-black/70 hover:bg-primary transition-colors shrink-0 flex items-center justify-center"
+                >
+                  <Trash className="h-4 w-4" />
+                  <span className="sr-only">Clear conversation</span>
+                </Button>
+                {/* Close Button - Moved from top */}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => invoke("close_popup_window").catch(console.error)}
+                  title="Close window"
+                  className="h-8 w-8 rounded-full px-0 bg-black/70 hover:bg-primary transition-colors shrink-0 flex items-center justify-center"
+                >
+                  <X className="h-4 w-4" />
+                  <span className="sr-only">Close</span>
                 </Button>
                 <Button
                   size="sm"
