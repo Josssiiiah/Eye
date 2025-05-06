@@ -41,7 +41,11 @@ image = "0.25"  # Image processing functionality
 
 # Platform-specific dependencies
 [target."cfg(target_os = \"macos\")".dependencies]
-cocoa = "0.25"
+cocoa = "0.26" # Let the default feature-set load, appkit is included by default
+core-graphics = "0.23"   # CGWindowListCreateImage & friends
+core-foundation = "0.10"   # For CFDataGetBytePtr/Length FFI
+objc = "0.2"   # msg_send! macro
+foreign-types-shared = "0.3"
 
 # Add AWS SDK dependencies for R2 (S3 compatible)
 aws-config = { version = "1.1.9", features = ["behavior-version-latest"] }

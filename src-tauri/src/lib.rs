@@ -17,6 +17,23 @@ use aws_sdk_s3::config::Region;
 use aws_sdk_s3::presigning::PresigningConfig; // Import PresigningConfig
 use anyhow::{anyhow, Context}; // Import anyhow and Context
 
+#[macro_use]
+extern crate objc; // brings msg_send!, sel! and sel_impl!
+
+#[cfg(target_os = "macos")]
+use {
+    objc::runtime::Object,         // For macOS NSWindow access
+
+    cocoa::foundation::NSRect,
+
+    core_graphics::{
+        display::{kCGWindowImageDefault,
+                  kCGWindowListOptionOnScreenBelowWindow,
+                  CGWindowListCreateImage},
+        geometry::{CGRect, CGPoint, CGSize},
+    },
+};
+
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -568,9 +585,10 @@ async fn close_drag_window<R: Runtime>(app: AppHandle<R>) -> Result<()> {
     Ok(())
 }
 
-#[tauri::command]
-async fn capture_region_and_upload(window: Window) -> std::result::Result<UploadResult, String> {
-    use xcap::Window as XcapWindow;    use image::RgbaImage;
+#[cfg(not(target_os = "macos"))]
+async fn capture_region_xcap(window: Window) -> std::result::Result<UploadResult, String> {
+    use xcap::Window as XcapWindow;
+    use image::RgbaImage;
     use std::io::Cursor;
 
     // Get window title to find the corresponding xcap window
@@ -699,6 +717,78 @@ async fn capture_region_and_upload(window: Window) -> std::result::Result<Upload
     }
 
     Ok(upload_result)
+}
+
+#[cfg(target_os = "macos")]
+async fn capture_region_core_graphics(window: Window) -> std::result::Result<UploadResult, String> {
+    use std::env::temp_dir;
+    use uuid::Uuid;
+
+    // ----- 1. identify the NSWindow & its CG window number -----
+    let ns_win = window.ns_window().map_err(|e| e.to_string())? as *mut Object;
+    let win_id: u32 = unsafe { msg_send![ns_win, windowNumber] };
+
+    // ----- 2. get window frame (in screen coords, already flipped for CG) -----
+    #[allow(non_upper_case_globals)]
+    let ns_frame: NSRect = unsafe { msg_send![ns_win, frame] };
+    let rect = CGRect::new(
+        &CGPoint::new(ns_frame.origin.x, ns_frame.origin.y),
+        &CGSize::new(ns_frame.size.width, ns_frame.size.height),
+    );
+
+    // ----- 3. capture *only* what is underneath that window -----
+    let cg_ref = unsafe {
+        CGWindowListCreateImage(
+            rect,
+            kCGWindowListOptionOnScreenBelowWindow,
+            win_id,
+            kCGWindowImageDefault,
+        )
+    };
+    if cg_ref.is_null() {
+        return Err("CGWindowListCreateImage returned null".into());
+    }
+
+    // Create a temporary file
+    let tmp = temp_dir().join(format!("region-{}.png", Uuid::new_v4()));
+    let tmp_path_str = tmp.to_string_lossy().to_string();
+    
+    // Using macOS built-in screencapture utility - most reliable approach
+    use std::process::Command;
+    let _ = Command::new("screencapture")
+        .arg("-x") // No sound
+        .arg("-o") // No shadow
+        .arg("-R") // Region
+        .arg(format!("{},{},{},{}", 
+            rect.origin.x, rect.origin.y, 
+            rect.size.width, rect.size.height))
+        .arg(&tmp_path_str)
+        .output()
+        .map_err(|e| format!("Failed to capture screen region: {}", e))?;
+    
+    // Upload the image using the existing function
+    let upload = upload_image_to_r2(tmp_path_str)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Cleanup
+    let _ = std::fs::remove_file(&tmp); // Best effort to remove temp file
+    Ok(upload)
+}
+
+#[tauri::command]
+async fn capture_region_and_upload(window: Window) -> std::result::Result<UploadResult, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Added curly braces for clarity and to ensure return is from this block
+        return capture_region_core_graphics(window).await;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Added curly braces for clarity and to ensure return is from this block
+        return capture_region_xcap(window).await; // existing body moved here
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
