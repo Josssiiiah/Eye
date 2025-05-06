@@ -5,7 +5,6 @@ use std::env;
 use serde::{Deserialize, Serialize};
 use reqwest;
 use tokio_stream::StreamExt;
-use reqwest::Response;
 use std::path::Path;
 use uuid::Uuid;
 use std::time::Duration; // Import Duration for presigning
@@ -60,6 +59,7 @@ struct ChatMessage {
 // Define a struct to deserialize the streaming chunk from Mastra
 // Assuming it sends JSON objects with a 'text' field per chunk
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct MastraStreamChunk {
     text: Option<String>,
     // Add other fields if Mastra sends more, like 'finishReason'
@@ -232,8 +232,10 @@ async fn chat_mastra<R: Runtime>(
     println!("Sending request to Mastra stream API. Payload:");
     println!("{}", serde_json::to_string_pretty(&request_body).unwrap_or_default());
 
-    // Ensure the popup window exists before proceeding
-    let window = app.get_webview_window("popup").ok_or_else(|| "Popup window not found".to_string())?;
+    // Try to get either the popup window or the drag-chat window
+    let window = app.get_webview_window("popup")
+        .or_else(|| app.get_webview_window("drag-chat"))
+        .ok_or_else(|| "Neither popup nor drag-chat window found".to_string())?;
 
     // Execute the request and process the stream
     let res = client.post(mastra_endpoint)
@@ -485,7 +487,7 @@ async fn upload_image_to_r2(file_path: String) -> tauri::Result<UploadResult> {
 
     // Upload to R2
     println!("Uploading to bucket: {}", bucket_name);
-    let put_object_output = client.put_object()
+    let _put_object_output = client.put_object()
         .bucket(&bucket_name)
         .key(&key)
         // Add appropriate content type if possible based on extension
@@ -534,6 +536,171 @@ async fn upload_image_to_r2(file_path: String) -> tauri::Result<UploadResult> {
 }
 // --- /R2 Upload Command ---
 
+#[tauri::command]
+async fn open_drag_window<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    // Check if the window already exists
+    if let Some(window) = app.get_webview_window("drag-chat") {
+        // If it exists, bring it to the front
+        window.set_focus()?;
+    } else {
+        // If it doesn't exist, create it
+        let builder = tauri::WebviewWindowBuilder::new(&app, "drag-chat", WebviewUrl::App("drag.html".into()))
+            .title("Drag Chat")
+            .inner_size(420.0, 300.0)
+            .position(200.0, 200.0)
+            .transparent(true) 
+            .decorations(false) // No window decorations (title bar, etc.)
+            .skip_taskbar(true)
+            .focused(true)
+            .always_on_top(false); // Let the user move it behind other windows
+
+        // Create the window
+        let _window = builder.build()?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn close_drag_window<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    if let Some(window) = app.get_webview_window("drag-chat") {
+        window.close()?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn capture_region_and_upload(window: Window) -> std::result::Result<UploadResult, String> {
+    use xcap::Window as XcapWindow;    use image::RgbaImage;
+    use std::io::Cursor;
+
+    // Get window title to find the corresponding xcap window
+    let window_title = window.title().map_err(|e| format!("Failed to get window title: {}", e))?;
+    let window_id = window.label();
+
+    println!("Looking for window with label: {} and title: {}", window_id, window_title);
+
+    // Find all windows
+    let xcap_windows = XcapWindow::all().map_err(|e| format!("Failed to get window list: {}", e))?;
+    
+    // Try to find our window by title
+    let mut found_window = None;
+    for xcap_window in &xcap_windows {
+        let title = xcap_window.title().map_err(|e| format!("Failed to get xcap window title: {}", e))?;
+        println!("Found window: {}", title);
+        
+        // Match on partial title since Tauri might add app name to title
+        if title.contains(&window_title) || title.contains(window_id) {
+            found_window = Some(xcap_window.clone());
+            println!("Found matching window: {}", title);
+            break;
+        }
+    }
+
+    // If we can't find by title, use window dimensions as fallback
+    if found_window.is_none() {
+        println!("Couldn't find window by title, falling back to position and size matching");
+        
+        // Get window geometry in physical pixels
+        let position = window.outer_position().map_err(|e| format!("Failed to get window position: {}", e))?;
+        let size = window.outer_size().map_err(|e| format!("Failed to get window size: {}", e))?;
+        let scale_factor = window.scale_factor().map_err(|e| format!("Failed to get scale factor: {}", e))?;
+        
+        // Convert from logical to physical pixels
+        let x = (position.x as f64 * scale_factor) as i32;
+        let y = (position.y as f64 * scale_factor) as i32;
+        let w = (size.width as f64 * scale_factor) as u32;
+        let h = (size.height as f64 * scale_factor) as u32;
+        
+        println!("Looking for window at ({}, {}) with size {}x{}", x, y, w, h);
+        
+        // Find window with closest matching position and size
+        for xcap_window in &xcap_windows {
+            if xcap_window.is_minimized().map_err(|e| format!("Failed to check if window is minimized: {}", e))? {
+                continue;
+            }
+            
+            let wx = xcap_window.x().map_err(|e| format!("Failed to get xcap window x: {}", e))?;
+            let wy = xcap_window.y().map_err(|e| format!("Failed to get xcap window y: {}", e))?;
+            let ww = xcap_window.width().map_err(|e| format!("Failed to get xcap window width: {}", e))?;
+            let wh = xcap_window.height().map_err(|e| format!("Failed to get xcap window height: {}", e))?;
+            
+            // Check if positions are close (within 20 pixels)
+            let position_close = (wx - x).abs() < 20 && (wy - y).abs() < 20;
+            // Check if sizes are close (within 20 pixels)
+            let size_close = ((ww as i32) - (w as i32)).abs() < 20 && ((wh as i32) - (h as i32)).abs() < 20;
+            
+            if position_close && size_close {
+                let title = xcap_window.title().unwrap_or_else(|_| "Unknown".to_string());
+                println!("Found window by position/size: {}", title);
+                found_window = Some(xcap_window.clone());
+                break;
+            }
+        }
+    }
+
+    // Capture the window if found
+    let full_img = if let Some(xcap_window) = found_window {
+        xcap_window.capture_image().map_err(|e| format!("Failed to capture window image: {}", e))?
+    } else {
+        // Fallback to original method if window can't be found
+        println!("Falling back to screen region capture");
+        
+        // Get window geometry in physical pixels
+        let position = window.outer_position().map_err(|e| format!("Failed to get window position: {}", e))?;
+        let size = window.outer_size().map_err(|e| format!("Failed to get window size: {}", e))?;
+        let scale_factor = window.scale_factor().map_err(|e| format!("Failed to get scale factor: {}", e))?;
+        
+        // Convert from logical to physical pixels
+        let x = (position.x as f64 * scale_factor) as i32;
+        let y = (position.y as f64 * scale_factor) as i32;
+        let w = (size.width as f64 * scale_factor) as u32;
+        let h = (size.height as f64 * scale_factor) as u32;
+        
+        // Use the original monitor-based capture as fallback
+        use xcap::Monitor;
+        let monitor = Monitor::from_point(x, y).map_err(|e| format!("Failed to get monitor at point ({}, {}): {}", x, y, e))?;
+        let monitor_img = monitor.capture_image().map_err(|e| format!("Failed to capture monitor image: {}", e))?;
+        
+        // Crop to the rectangle under our window
+        image::imageops::crop_imm(&monitor_img, x as u32, y as u32, w, h).to_image()
+    };
+
+    // The rest of the process remains the same
+    // Encode the image to PNG format
+    let mut png_bytes = Vec::new();
+    let mut cursor = Cursor::new(&mut png_bytes);
+    full_img.write_to(&mut cursor, image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to encode image as PNG: {}", e))?;
+
+    // Create a temporary file to store the PNG data
+    use std::env::temp_dir;
+    use std::fs::File;
+    use std::io::Write;
+    use uuid::Uuid;
+
+    let temp_path = temp_dir().join(format!("region-capture-{}.png", Uuid::new_v4()));
+    let temp_path_str = temp_path.to_string_lossy().to_string();
+    
+    let mut file = File::create(&temp_path)
+        .map_err(|e| format!("Failed to create temporary file: {}", e))?;
+    file.write_all(&png_bytes)
+        .map_err(|e| format!("Failed to write to temporary file: {}", e))?;
+    file.flush()
+        .map_err(|e| format!("Failed to flush temporary file: {}", e))?;
+
+    // Use the existing R2 upload functionality
+    let upload_result = upload_image_to_r2(temp_path_str.clone())
+        .await
+        .map_err(|e| format!("Failed to upload image to R2: {}", e))?;
+
+    // Optional: Clean up the temporary file (best effort)
+    if let Err(e) = std::fs::remove_file(&temp_path) {
+        eprintln!("Warning: Failed to remove temporary file {}: {}", temp_path_str, e);
+    }
+
+    Ok(upload_result)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Load .env file variables into environment
@@ -571,7 +738,10 @@ pub fn run() {
             close_popup_window,
             chat,
             upload_image_to_r2,
-            chat_mastra
+            chat_mastra,
+            open_drag_window,
+            close_drag_window,
+            capture_region_and_upload
         ])
         // Add setup to ensure AppHandle is available for chat_mastra
         .setup(|app| {

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Drag Chat</title>
+    <link rel="stylesheet" href="/src/App.css" />
+    <style>
+      html,
+      body {
+        background: transparent;
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        border-radius: 12px;
+      }
+      #root {
+        height: 100%;
+        border-radius: 12px;
+        overflow: hidden;
+      }
+      /* Add shadow styling to make the window visible while transparent */
+      .drag-shadow {
+        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1),
+          0 8px 10px -6px rgba(0, 0, 0, 0.1);
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

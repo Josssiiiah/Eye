@@ -7,8 +7,19 @@ function App() {
     invoke("open_popup_window").catch(console.error);
   };
 
+  const openDragWindow = () => {
+    invoke("open_drag_window").catch(console.error);
+  };
+
   return (
     <main className="fixed top-0 left-0 right-0 bg-black/20 backdrop-blur-sm h-12 flex items-center justify-end px-4">
+      <Button
+        onClick={openDragWindow}
+        variant="ghost"
+        className="text-white hover:bg-white/20 mr-2"
+      >
+        Drag Chat
+      </Button>
       <Button
         onClick={openPopup}
         variant="ghost"

@@ -20,7 +20,14 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "capabilities": [
+        {
+          "identifier": "default",
+          "windows": ["main", "popup", "drag-chat"],
+          "permissions": ["core:event:default"]
+        }
+      ]
     },
     "macOSPrivateApi": true
   },

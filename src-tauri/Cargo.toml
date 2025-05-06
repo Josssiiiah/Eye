@@ -36,6 +36,8 @@ tauri-plugin-screenshots = "2.0.0-beta.4"
 tauri-plugin-macos-permissions = "2.0.0-beta"
 tauri-plugin-fs = "2.0.0-beta"
 base64 = "0.22.1"
+xcap = "0.5.1"  # Window/region capture capability
+image = "0.25"  # Image processing functionality
 
 # Platform-specific dependencies
 [target."cfg(target_os = \"macos\")".dependencies]
