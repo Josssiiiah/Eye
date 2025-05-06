@@ -135,7 +135,7 @@ export default function DragWindow() {
   // Modify the renderMessageContent function to better handle images within messages
   const renderMessageContent = (content: string) => {
     // Check for image directly embedded in the content (new format)
-    const directImageRegex = /\!\[Screenshot\]\((data:image\/[^)]+)\)/;
+    const directImageRegex = /\!\[Screenshot\]\(([^)]+)\)/;
     const directMatch = content.match(directImageRegex);
 
     if (directMatch && directMatch[1]) {
@@ -479,39 +479,11 @@ export default function DragWindow() {
               className="flex items-center justify-between px-4 py-2"
             >
               <div className="flex items-center space-x-2">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-8 w-8"
-                  onClick={captureRegionAndProcess}
-                  disabled={isProcessing || isUploading}
-                >
-                  <Camera className="h-4 w-4" />
-                </Button>
                 <span className="text-xs text-muted-foreground">
                   Drag to position • Resize as needed
                 </span>
               </div>
-              <div className="flex items-center gap-1">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7"
-                  onClick={clearConversation}
-                >
-                  <Trash className="h-4 w-4" />
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7"
-                  onClick={() =>
-                    invoke("close_drag_window").catch(console.error)
-                  }
-                >
-                  <X className="h-4 w-4" />
-                </Button>
-              </div>
+              <div className="flex items-center gap-1"></div>
             </div>
           </div>
 
@@ -668,13 +640,48 @@ export default function DragWindow() {
                 onFocus={() => setIsInputFocused(true)}
                 onBlur={() => setIsInputFocused(false)}
               />
+              <div className="absolute right-2 top-1/2 transform -translate-y-1/2 flex items-center gap-1">
+                <Button
+                  onClick={handleSendMessage}
+                  disabled={isProcessing || (!input.trim() && !presignedUrl)}
+                  size="sm"
+                  className="h-8"
+                >
+                  Send
+                </Button>
+              </div>
+            </div>
+            {/* Moved Buttons Area */}
+            <div className="mt-3 flex items-center justify-between px-1">
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8"
+                  onClick={captureRegionAndProcess}
+                  disabled={isProcessing || isUploading}
+                  title="Capture Region"
+                >
+                  <Camera className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8"
+                  onClick={clearConversation}
+                  title="Clear Conversation"
+                >
+                  <Trash className="h-4 w-4" />
+                </Button>
+              </div>
               <Button
-                onClick={handleSendMessage}
-                disabled={isProcessing || (!input.trim() && !presignedUrl)}
-                size="sm"
-                className="absolute right-2 top-1/2 transform -translate-y-1/2 h-8"
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={() => invoke("close_drag_window").catch(console.error)}
+                title="Close Window"
               >
-                Send
+                <X className="h-4 w-4" />
               </Button>
             </div>
           </div>
