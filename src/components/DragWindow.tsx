@@ -5,7 +5,6 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { useEffect, useCallback, useRef, FormEvent, useState } from "react";
 import { cn } from "../lib/utils";
-import { motion, AnimatePresence } from "framer-motion";
 import { useChat, Message } from "@ai-sdk/react";
 import { v4 as uuidv4 } from "uuid";
 import { readFile, BaseDirectory, writeFile } from "@tauri-apps/plugin-fs";
@@ -148,7 +147,7 @@ export default function DragWindow() {
             src={imageUrl}
             alt="Screenshot"
             className="max-w-full rounded-md border border-border/30 mt-2"
-            style={{ maxHeight: "300px" }}
+            style={{ maxHeight: "300px", objectFit: "contain" }}
           />
         </>
       );
@@ -172,7 +171,7 @@ export default function DragWindow() {
               src={screenshotPreview}
               alt="Screenshot Preview"
               className="max-w-full rounded-md border border-border/30 mt-2"
-              style={{ maxHeight: "300px" }}
+              style={{ maxHeight: "300px", objectFit: "contain" }}
             />
             <div className="absolute inset-0 bg-black/20 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity rounded-md">
               <span className="text-white text-xs font-bold bg-black/50 px-2 py-1 rounded">
@@ -185,7 +184,7 @@ export default function DragWindow() {
     }
 
     // Just return text if no image
-    return content;
+    return <div className="whitespace-pre-wrap">{content}</div>;
   };
 
   // Send message handler
@@ -461,8 +460,8 @@ export default function DragWindow() {
   }, [messages, screenshotPreview]);
 
   return (
-    <div className="fixed inset-0 bg-background/15 rounded-xl backdrop-blur-sm flex h-full drag-shadow">
-      {/* Outer container for scrolling */}
+    <div className="fixed inset-0 bg-background/5 rounded-xl backdrop-blur-sm flex h-full drag-shadow">
+      {/* Outer container for scrolling - NOW A MOTION.DIV */}
       <div
         ref={scrollAreaRef}
         className="w-full h-full overflow-y-auto [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
@@ -479,9 +478,7 @@ export default function DragWindow() {
               className="flex items-center justify-between px-4 py-2"
             >
               <div className="flex items-center space-x-2">
-                <span className="text-xs text-muted-foreground">
-                  Drag to position • Resize as needed
-                </span>
+                <span className="text-xs text-white">Drag or Resize</span>
               </div>
               <div className="flex items-center gap-1"></div>
             </div>
@@ -490,28 +487,19 @@ export default function DragWindow() {
           {/* Chat Area & Input */}
           <div className="flex flex-col flex-grow px-4 pt-2 pb-6">
             {/* Messages Area */}
-            <div className="flex-grow space-y-3 overflow-y-auto pr-2 min-h-0">
+            <div className="flex-grow space-y-3 pr-2 min-h-0">
               {messages.length === 0 &&
                 !isProcessing &&
                 !fetchError &&
                 !screenshotPreview && (
                   <div className="flex flex-col items-center justify-center h-full text-center space-y-2 text-muted-foreground/70">
-                    <p className="text-sm font-medium">
-                      Position this window over content you want to analyze
-                    </p>
-                    <p className="text-xs">
-                      Then press the camera button or wait for auto-capture
-                    </p>
+                    {/* Empty state content */}
                   </div>
                 )}
 
               {/* Add standalone screenshot preview when available but no messages yet */}
               {messages.length === 0 && screenshotPreview && !isProcessing && (
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.95 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  className="flex flex-col items-center justify-center mt-4 p-3"
-                >
+                <div className="flex flex-col items-center justify-center mt-4 p-3">
                   <div className="mb-2 text-sm text-center text-muted-foreground">
                     Screenshot captured:
                   </div>
@@ -520,7 +508,7 @@ export default function DragWindow() {
                       src={screenshotPreview}
                       alt="Screenshot Preview"
                       className="max-w-full rounded-md"
-                      style={{ maxHeight: "300px" }}
+                      style={{ maxHeight: "300px", objectFit: "contain" }}
                     />
                     {/* Optional loading overlay while processing starts */}
                     {isUploading && (
@@ -531,91 +519,51 @@ export default function DragWindow() {
                       </div>
                     )}
                   </div>
-                  <div className="mt-4 flex flex-col items-center">
-                    <div className="text-xs text-muted-foreground mb-2">
-                      Type your question or use quick action:
-                    </div>
-                    <Button
-                      size="sm"
-                      onClick={() => {
-                        setInput("Analyze what's in this image");
-                        handleSendMessage();
-                      }}
-                      className="flex items-center gap-1 mb-2"
-                    >
-                      <p>Analyze this image</p>
-                    </Button>
-
-                    <div className="flex gap-2 mt-1">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={openSavedScreenshot}
-                        className="flex items-center gap-1"
-                      >
-                        <Download className="h-3 w-3" />
-                        <span className="text-xs">Show in Finder</span>
-                      </Button>
-                    </div>
-                  </div>
-                </motion.div>
+                </div>
               )}
 
-              {messages.map((m) => (
-                <motion.div
-                  key={m.id}
-                  layout
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0 }}
-                  className={cn(
-                    "p-3 rounded-xl shadow-md border border-border/30 text-sm",
-                    m.role === "user"
-                      ? "bg-primary/10 text-primary-foreground place-self-end ml-10"
-                      : "bg-background/80 place-self-start mr-10",
-                    // Add a style for the potentially empty streaming message
-                    m.role === "assistant" &&
-                      m.content === "" &&
-                      isProcessing &&
-                      "min-h-[20px]" // Give it min height while streaming empty
-                  )}
-                >
-                  {/* Render content with proper image handling */}
-                  {m.role === "assistant" &&
-                  m.id === assistantIdRef.current &&
-                  isProcessing &&
-                  m.content === "" ? (
-                    <span className="animate-pulse">▋</span>
-                  ) : (
-                    renderMessageContent(m.content)
-                  )}
-                </motion.div>
-              ))}
+              {/* Messages container - changed to grid layout */}
+              <div className="grid grid-cols-1 gap-3 w-full">
+                {messages.map((m) => (
+                  <div
+                    key={m.id}
+                    className={cn(
+                      "p-3 rounded-xl shadow-md border border-border/30 text-sm max-w-[85%] w-fit",
+                      m.role === "user"
+                        ? "bg-primary/10 text-primary-foreground justify-self-end"
+                        : "bg-background/80 justify-self-start",
+                      // Add a style for the potentially empty streaming message
+                      m.role === "assistant" &&
+                        m.content === "" &&
+                        isProcessing &&
+                        "min-h-[40px] min-w-[40px]" // Give it min height/width while streaming empty
+                    )}
+                  >
+                    {/* Render content with proper image handling */}
+                    {m.role === "assistant" &&
+                    m.id === assistantIdRef.current &&
+                    isProcessing &&
+                    m.content === "" ? (
+                      <span className="animate-pulse">▋</span>
+                    ) : (
+                      renderMessageContent(m.content)
+                    )}
+                  </div>
+                ))}
+              </div>
 
               {/* Error display */}
-              <AnimatePresence>
-                {fetchError && (
-                  <motion.div
-                    initial={{ opacity: 0, y: -10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0 }}
-                    className="text-sm text-red-400 font-medium rounded-md bg-red-500/10 border border-red-500/20 px-4 py-3 mt-4"
-                  >
-                    Error: {fetchError}
-                  </motion.div>
-                )}
-              </AnimatePresence>
+              {fetchError && (
+                <div className="text-sm text-red-400 font-medium rounded-md bg-red-500/10 border border-red-500/20 px-4 py-3 mt-4">
+                  Error: {fetchError}
+                </div>
+              )}
 
               {/* Display uploading indicator */}
               {isUploading && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  className="text-xs text-center text-muted-foreground italic mt-2"
-                >
+                <div className="text-xs text-center text-muted-foreground italic mt-2">
                   Uploading region capture...
-                </motion.div>
+                </div>
               )}
             </div>
 
@@ -634,7 +582,7 @@ export default function DragWindow() {
                 onKeyDown={handleKeyDown}
                 disabled={isProcessing}
                 className={cn(
-                  "pr-20 py-6 bg-background/90 border-border/30",
+                  "pr-20 py-6 bg-background/30 border-border/30 placeholder-white",
                   isInputFocused ? "ring-2 ring-primary/20" : ""
                 )}
                 onFocus={() => setIsInputFocused(true)}
@@ -645,7 +593,7 @@ export default function DragWindow() {
                   onClick={handleSendMessage}
                   disabled={isProcessing || (!input.trim() && !presignedUrl)}
                   size="sm"
-                  className="h-8"
+                  className="h-8 text-white"
                 >
                   Send
                 </Button>
@@ -689,28 +637,23 @@ export default function DragWindow() {
       </div>
 
       {/* Toast Notification */}
-      <AnimatePresence>
-        {toast && (
-          <motion.div
-            initial={{ opacity: 0, y: -10 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
-            className={cn(
-              "fixed top-4 right-4 px-4 py-2 rounded-lg shadow-lg z-50 flex items-center gap-2",
-              toast.type === "success"
-                ? "bg-green-500/20 text-green-500 border border-green-500/30"
-                : "bg-red-500/20 text-red-500 border border-red-500/30"
-            )}
-          >
-            {toast.type === "success" ? (
-              <Check className="h-4 w-4" />
-            ) : (
-              <X className="h-4 w-4" />
-            )}
-            <span className="text-sm font-medium">{toast.message}</span>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {toast && (
+        <div
+          className={cn(
+            "fixed top-4 right-4 px-4 py-2 rounded-lg shadow-lg z-50 flex items-center gap-2",
+            toast.type === "success"
+              ? "bg-green-500/20 text-green-500 border border-green-500/30"
+              : "bg-red-500/20 text-red-500 border border-red-500/30"
+          )}
+        >
+          {toast.type === "success" ? (
+            <Check className="h-4 w-4" />
+          ) : (
+            <X className="h-4 w-4" />
+          )}
+          <span className="text-sm font-medium">{toast.message}</span>
+        </div>
+      )}
     </div>
   );
 }

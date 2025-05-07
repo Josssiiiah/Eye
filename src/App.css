@@ -97,9 +97,6 @@ h1 {
   text-align: center;
 }
 
-
-
-
 #greet-input {
   margin-right: 5px;
 }
@@ -109,8 +106,6 @@ h1 {
     color: #f6f6f6;
     background-color: transparent;
   }
-
-
 }
 
 @theme inline {

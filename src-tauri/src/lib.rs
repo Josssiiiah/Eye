@@ -552,6 +552,15 @@ async fn upload_image_to_r2(file_path: String) -> tauri::Result<UploadResult> {
 
 #[tauri::command]
 async fn open_drag_window<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+
+      // Close *all* stray drag windows first
+      for win in app.windows().values() {
+        if win.label().starts_with("drag-chat") {
+            win.set_focus()?;
+            return Ok(());
+        }
+    }
+
     // Check if the window already exists
     if let Some(window) = app.get_webview_window("drag-chat") {
         // If it exists, bring it to the front
