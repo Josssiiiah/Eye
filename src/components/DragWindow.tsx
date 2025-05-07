@@ -460,7 +460,7 @@ export default function DragWindow() {
   }, [messages, screenshotPreview]);
 
   return (
-    <div className="fixed inset-0 bg-background/5 rounded-xl backdrop-blur-sm flex h-full drag-shadow">
+    <div className="fixed inset-0 bg-background/5 rounded-xl backdrop-blur-sm flex h-full">
       {/* Outer container for scrolling - NOW A MOTION.DIV */}
       <div
         ref={scrollAreaRef}
@@ -471,7 +471,7 @@ export default function DragWindow() {
           {/* Drag Region & Header */}
           <div
             data-tauri-drag-region
-            className="sticky top-0 z-10  border-b border-border/20"
+            className="sticky top-0 z-10 "
           >
             <div
               data-tauri-drag-region
@@ -487,7 +487,7 @@ export default function DragWindow() {
           {/* Chat Area & Input */}
           <div className="flex flex-col flex-grow px-4 pt-2 pb-6">
             {/* Messages Area */}
-            <div className="flex-grow space-y-3 pr-2 min-h-0">
+            <div className="flex-grow space-y-3 overflow-y-auto pr-2 min-h-0">
               {messages.length === 0 &&
                 !isProcessing &&
                 !fetchError &&
